@@ -148,7 +148,17 @@ if [[ "$(docker info --format '{{.OperatingSystem}}' 2>/dev/null)" == *[Dd]ocker
   sleep 5
   pass "gateway pointed at host.docker.internal for Docker Desktop (backup: $toml.bak-kyverno)"
 fi
-openshell status >/dev/null 2>&1 || { fail "the OpenShell gateway is not reachable — run: openshell status"; exit 1; }
+# `openshell status` exits 0 even when no gateway is set up, so read what it says. Without a connected gateway the
+# next commands stop with "No active gateway", which used to surface as "could not register the provider profile".
+STATUS_OUT="$(openshell status 2>&1)"
+if [[ "$STATUS_OUT" != *Connected* ]]; then
+  fail "the OpenShell gateway is not connected: $(printf '%s\n' "$STATUS_OUT" | awk 'NF && !/Gateway Status|Server Status/{sub(/^ +/, ""); print; exit}')"
+  info "start it and register it (the OpenShell installer does the same):"
+  info "  brew services start openshell && openshell gateway add https://127.0.0.1:17670 --local --name openshell"
+  info "or run the installer again: curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${OPENSHELL_VERSION}/install.sh | OPENSHELL_VERSION=${OPENSHELL_VERSION} sh"
+  info "then check: openshell status   (it should say Connected)"
+  exit 1
+fi
 pass "OpenShell $(openshell --version 2>/dev/null | head -n 1)"
 
 step "2. Image"

@@ -153,9 +153,11 @@ fi
 STATUS_OUT="$(openshell status 2>&1)"
 if [[ "$STATUS_OUT" != *Connected* ]]; then
   fail "the OpenShell gateway is not connected: $(printf '%s\n' "$STATUS_OUT" | awk 'NF && !/Gateway Status|Server Status/{sub(/^ +/, ""); print; exit}')"
-  info "start it and register it (the OpenShell installer does the same):"
-  info "  brew services start openshell && openshell gateway add https://127.0.0.1:17670 --local --name openshell"
-  info "or run the installer again: curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${OPENSHELL_VERSION}/install.sh | OPENSHELL_VERSION=${OPENSHELL_VERSION} sh"
+  info "see what is registered: openshell gateway list. A gateway at http://127.0.0.1:8080 is left over from an old"
+  info "OpenShell release and cannot be used: remove it with  openshell gateway remove <name>  (or  openshell gateway destroy"
+  info "on an old CLI), then install OpenShell again, which sets up and registers the current gateway:"
+  info "  curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${OPENSHELL_VERSION}/install.sh | OPENSHELL_VERSION=${OPENSHELL_VERSION} OPENSHELL_ACK_BREAKING_UPGRADE=1 sh"
+  info "(if the gateway is just stopped:  brew services start openshell )"
   info "then check: openshell status   (it should say Connected)"
   exit 1
 fi

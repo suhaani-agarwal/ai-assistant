@@ -1,0 +1,26 @@
+# Label catalog for the pr-management action. Each key is a label name; `color` (quoted hex), `description`,
+# and optional `rules` (actions/labeler path matchers). Keep the lifecycle labels the action applies.
+needs-author-action:
+  color: d93f0b
+  description: Waiting on the PR author
+ready-for-review:
+  color: 0e8a16
+  description: Checks pass and threads are resolved; ready for a maintainer
+workflow-approval-required:
+  color: fbca04
+  description: CI workflows need a maintainer to approve a run
+stale:
+  color: ededed
+  description: No author activity; will be closed if it stays quiet
+merge-conflicts:
+  color: b60205
+  description: PR has merge conflicts
+
+area/docs:
+  color: 0075ca
+  description: Documentation
+  rules:
+    - changed-files:
+        - any-glob-to-any-file:
+            - docs/**
+            - "**/*.md"

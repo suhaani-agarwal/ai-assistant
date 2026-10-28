@@ -1,0 +1,81 @@
+name: PR lifecycle
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+  schedule:
+    - cron: "19 * * * *"
+    - cron: "29 6 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Lifecycle operation
+        type: choice
+        options: [readiness, stale]
+        default: readiness
+      dry_run:
+        description: Only preview changes (leave enabled until you have read a preview run)
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  readiness:
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event_name == 'schedule' && github.event.schedule == '19 * * * *') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'readiness')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: pr-readiness
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      checks: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout trusted configuration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Readiness classification
+        uses: kyverno/assistant/actions/pr-management@74595e3b0157066922aebcca0846fdefd41e4d40
+        with:
+          mode: readiness
+          # Scheduled and PR-event runs follow the repository variable PR_AUTOMATION_LIVE; a manual run follows its own checkbox.
+          dry-run: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && 'true' || 'false') || (vars.PR_AUTOMATION_LIVE == 'true' && 'false' || 'true') }}
+
+  stale:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '29 6 * * *') ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'stale')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: pr-stale-author-action
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout trusted configuration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Stale handling and reviewer reminders
+        uses: kyverno/assistant/actions/pr-management@74595e3b0157066922aebcca0846fdefd41e4d40
+        with:
+          mode: stale
+          # Scheduled and PR-event runs follow the repository variable PR_AUTOMATION_LIVE; a manual run follows its own checkbox.
+          dry-run: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && 'true' || 'false') || (vars.PR_AUTOMATION_LIVE == 'true' && 'false' || 'true') }}

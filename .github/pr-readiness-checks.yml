@@ -1,0 +1,42 @@
+# Starting point for the pr-management action's readiness checks. Each key is a possible finding; `test` and
+# `message` are jq expressions run against the PR object that actions/pr-management/readiness.sh fetches, with
+# `$author` bound to the PR author's login. Add a check by adding an entry; the action itself never changes.
+# Anything specific to your repo (required check names, infrastructure checks to ignore) belongs here.
+
+dco:
+  message: '"fix the DCO"'
+  test: |
+    [.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]?
+      | select((.name // .context) == "DCO") | (.conclusion // .state)]
+    | any(. == "FAILURE" or . == "ERROR" or . == "TIMED_OUT" or . == "ACTION_REQUIRED" or . == "CANCELLED" or . == "STALE" or . == "STARTUP_FAILURE")
+
+# Every failing check except DCO (own message above) blocks readiness. A check the author cannot fix (flaky,
+# infrastructure) should not: add its name to the `["DCO"]` list in both `message` and `test` below. The action also
+# supports an optional `infra_checks` entry that reports such checks as advice without blocking; see
+# actions/pr-management/README.md.
+ci:
+  message: |
+    "fix the failing check(s): " + (
+      [.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]?
+        | select((.name // .context) as $n | ["DCO"] | any(. == $n) | not)
+        | select((.conclusion // .state) as $c | ["FAILURE","ERROR","TIMED_OUT","ACTION_REQUIRED","CANCELLED","STALE","STARTUP_FAILURE"] | any(. == $c))
+        | (.name // .context)]
+      | join(", ")
+    )
+  test: |
+    [.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]?
+      | select((.name // .context) as $n | ["DCO"] | any(. == $n) | not) | (.conclusion // .state)]
+    | any(. == "FAILURE" or . == "ERROR" or . == "TIMED_OUT" or . == "ACTION_REQUIRED" or . == "CANCELLED" or . == "STALE" or . == "STARTUP_FAILURE")
+
+conflicts:
+  message: '"fix the merge conflicts"'
+  test: |
+    [.labels.nodes[].name] | any(. == "merge-conflicts")
+
+threads:
+  message: '"resolve all review comments — mark each thread resolved, or leave a response if you are not sure what to do"'
+  test: |
+    [.reviewThreads.nodes[]
+      | select(.isResolved | not)
+      | select(.comments.nodes[0].author.login != $author)
+    ] | length > 0

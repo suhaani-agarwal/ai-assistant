@@ -1,0 +1,41 @@
+name: PR Labeler
+
+on:
+  push:
+    branches: [main]
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Only preview labels and conflicts
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: pr-labels-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  labeler:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout trusted configuration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Path labels and merge conflicts
+        uses: kyverno/assistant/actions/pr-management@74595e3b0157066922aebcca0846fdefd41e4d40
+        with:
+          mode: labels
+          # Scheduled and PR-event runs follow the repository variable PR_AUTOMATION_LIVE; a manual run follows its own checkbox.
+          dry-run: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && 'true' || 'false') || (vars.PR_AUTOMATION_LIVE == 'true' && 'false' || 'true') }}

@@ -222,7 +222,7 @@ EOF
 # --update-pin recognises a pinned reference by its shape alone: a `uses:` value that names pr-management or
 # issue-management and ends in @ and a full commit SHA. That covers each action and shared workflow, from any source,
 # with no list to keep up to date.
-pin_re='[^[:space:]]*(pr|issue)-management[^[:space:]@]*@[0-9a-f]{40}\'
+pin_re='[^[:space:]]*(pr|issue)-management[^[:space:]@]*@[0-9a-f]{40}'
 
 md_list() { # lines on stdin become a Markdown list of code spans
   # The backticks are Markdown, not command substitution.

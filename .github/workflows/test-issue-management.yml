@@ -7,6 +7,9 @@ on:
       - .github/workflows/issue-management.yml
       - .github/workflows/issue-management-validate.yml
       - .github/workflows/test-issue-management.yml
+      - scripts/adopt-ci.sh
+      - scripts/test-adopt-ci-pins.sh
+      - adopt-ci-templates/**
   push:
     branches: [main]
     paths:
@@ -14,6 +17,9 @@ on:
       - .github/workflows/issue-management.yml
       - .github/workflows/issue-management-validate.yml
       - .github/workflows/test-issue-management.yml
+      - scripts/adopt-ci.sh
+      - scripts/test-adopt-ci-pins.sh
+      - adopt-ci-templates/**
 
 permissions:
   contents: read
@@ -30,3 +36,7 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: '1'
         run: python3 -m unittest discover -s .github/actions/issue-management/tests -v
+      - name: Pin pattern of adopt-ci.sh
+        run: scripts/test-adopt-ci-pins.sh
+      - name: Validate shell syntax
+        run: bash -n scripts/adopt-ci.sh

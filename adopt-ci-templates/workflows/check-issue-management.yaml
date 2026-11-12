@@ -1,0 +1,22 @@
+name: Check issue management configuration
+
+on:
+  pull_request:
+    paths:
+      - ".github/issue-management.json"
+      - ".github/workflows/issue-management.yaml"
+      - ".github/workflows/check-issue-management.yaml"
+  push:
+    branches: [main]
+    paths:
+      - ".github/issue-management.json"
+      - ".github/workflows/issue-management.yaml"
+      - ".github/workflows/check-issue-management.yaml"
+
+permissions: {}
+
+jobs:
+  validate:
+    permissions:
+      contents: read
+    uses: kyverno/assistant/.github/workflows/issue-management-validate.yml@<full-commit-SHA>

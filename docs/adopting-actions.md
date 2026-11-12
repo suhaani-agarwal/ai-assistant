@@ -91,11 +91,23 @@ permissions each mode needs are in [`.github/actions/pr-management/README.md`](.
 
 ### Issue management
 
-`.github/workflows/issue-management.yml` is a separate shared workflow for issues, called the same way from a short
-caller with a daily `schedule` and `workflow_dispatch`. It reads `.github/issue-management.json` (optional; every key
-has a default) and follows the `ISSUE_AUTOMATION_LIVE` repository variable, so it previews until that is exactly
-`true`. It is not part of `scripts/adopt-ci.sh` yet: copy `adopt-ci-templates/workflows/issue-management.yaml` and, to
-override defaults, `adopt-ci-templates/issue-management.json`, and set the pin. The rules and keys are in
+Issue management is a separate adoption, with its own PR, so a repository can take it before or after the PR
+automation:
+
+```bash
+scripts/adopt-ci.sh --issues your-org/repo-a your-org/repo-b
+```
+
+It adds `.github/workflows/issue-management.yaml` (daily, preview), `.github/workflows/check-issue-management.yaml`
+(validates the config on every PR, no token) and `.github/issue-management.json`, and never overwrites a file.
+`--reviewers` is not needed: its comments mention no team. It opens the PR from `ci/adopt-issue-management`, warns about
+an existing `actions/stale` or similar workflow, and supports `--dry-run`. `--update-pin` moves the pins of both
+automations in a repository.
+
+Nothing happens until an admin sets the repository variable `ISSUE_AUTOMATION_LIVE` to `true`, separate from
+`PR_AUTOMATION_LIVE`. Until then every scheduled run writes what it would do to the job summary. No label needs
+creating by hand: the action creates `stale-issue` and `possibly-resolved` when it first runs live, and it uses
+`stale-issue` rather than `stale`, which the PR automation owns. The rules and keys are in
 [`.github/actions/issue-management/README.md`](../.github/actions/issue-management/README.md).
 
 ## Why a script, and what else was considered

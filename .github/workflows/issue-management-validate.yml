@@ -1,0 +1,27 @@
+# Reusable workflow: checks the calling repository's issue-management configuration. Read-only, needs no token and
+# never runs code from the proposed change, so it is safe on pull requests from forks. See docs/adopting-actions.md.
+#
+# The action is referenced by full path and commit because a local `./` path would resolve in the caller's checkout.
+# That commit is always older than this file's own; move it when the action changes.
+name: Issue management configuration check (reusable)
+
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout configuration under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate configuration without API access
+        uses: kyverno/assistant/.github/actions/issue-management@8173e4c89bb97e395b5605c8ef398803879e370c
+        with:
+          validate: 'true'

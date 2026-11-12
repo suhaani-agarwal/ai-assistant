@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Opens a pull request in each named repository that adds the shared CI actions (PR labelling, readiness and stale
-# handling), in preview mode. Run it once, from a laptop, with your own `gh` login; nothing is stored anywhere.
+# handling; or, with --issues, issue management), in preview mode. Run it once, from a laptop, with your own `gh` login; nothing is stored anywhere.
 #
 #   scripts/adopt-ci.sh --reviewers @your-org/maintainers your-org/repo-a your-org/repo-b
 #   scripts/adopt-ci.sh --reviewers @your-org/maintainers --dry-run your-org/repo-a
-#   scripts/adopt-ci.sh --update-pin your-org/repo-a    # repos that already use the action: move only its pin
+#   scripts/adopt-ci.sh --issues your-org/repo-a        # issue management instead: no reviewers needed
+#   scripts/adopt-ci.sh --update-pin your-org/repo-a    # repos that already use an action: move only its pins
 #
 # Existing files are never overwritten. The action is pinned to the commit of this checkout, which must be pushed.
 set -euo pipefail
@@ -16,23 +17,28 @@ reviewers=""
 dry_run=false
 branch=""
 update_pin=false
+issues=false
 
 die() { echo "error: $*" >&2; exit 1; }
 
 usage() {
   cat << 'EOF'
 usage: adopt-ci.sh --reviewers @org/team [options] owner/repo [owner/repo ...]
+       adopt-ci.sh --issues [options] owner/repo [owner/repo ...]
        adopt-ci.sh --update-pin [options] owner/repo [owner/repo ...]
 
   --reviewers @org/team  existing team of the repo's organisation that the bot mentions when a PR needs a maintainer
-                         (required, except with --update-pin)
-  --update-pin           for repos that already use pr-management: rewrite only the pinned action reference in their
-                         workflows, wherever it points now; add nothing and leave all config alone
+                         (required, except with --issues or --update-pin)
+  --issues               adopt the shared issue management (labels resolved issues, closes ones waiting on the
+                         reporter) instead of the PR automation; needs no reviewers. Opens its own PR, so a repo can
+                         take either one first
+  --update-pin           for repos that already use pr-management or issue-management: rewrite only the pinned action
+                         references in their workflows, wherever they point now; add nothing and leave all config alone
   --dry-run              show which files would change; push nothing, open nothing
   --source owner/repo    where the actions live (default: kyverno/assistant)
   --ref SHA              full commit of the source to pin (default: this checkout's HEAD)
-  --branch NAME          branch to open the PR from (default: ci/adopt-shared-actions; ci/update-pr-management-pin
-                         with --update-pin)
+  --branch NAME          branch to open the PR from (default: ci/adopt-shared-actions; ci/adopt-issue-management
+                         with --issues; ci/update-pr-management-pin with --update-pin)
 EOF
 }
 
@@ -42,6 +48,7 @@ while [[ $# -gt 0 ]]; do
     --reviewers) reviewers="${2:?--reviewers needs a value}"; shift 2 ;;
     --dry-run) dry_run=true; shift ;;
     --update-pin) update_pin=true; shift ;;
+    --issues) issues=true; shift ;;
     --source) source_repo="${2:?--source needs a value}"; shift 2 ;;
     --ref) ref="${2:?--ref needs a value}"; shift 2 ;;
     --branch) branch="${2:?--branch needs a value}"; shift 2 ;;
@@ -52,11 +59,18 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ ${#repos[@]} -gt 0 ]] || { usage >&2; die "name at least one owner/repo"; }
+[[ "$issues" == "false" || "$update_pin" == "false" ]] || die "--issues and --update-pin cannot be combined: --update-pin moves the pins of both"
 if [[ -z "$branch" ]]; then
-  if [[ "$update_pin" == "true" ]]; then branch="ci/update-pr-management-pin"; else branch="ci/adopt-shared-actions"; fi
+  if [[ "$update_pin" == "true" ]]; then
+    branch="ci/update-pr-management-pin"
+  elif [[ "$issues" == "true" ]]; then
+    branch="ci/adopt-issue-management"
+  else
+    branch="ci/adopt-shared-actions"
+  fi
 fi
 [[ "$source_repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || die "--source must look like owner/repo"
-if [[ "$update_pin" == "false" ]]; then
+if [[ "$update_pin" == "false" && "$issues" == "false" ]]; then
   # Same rule as the action's own config check; a single @user is rejected there.
   [[ "$reviewers" =~ ^@[A-Za-z0-9-]+/[A-Za-z0-9_.-]+$ ]] || die "--reviewers must look like @org/team"
 fi
@@ -70,12 +84,15 @@ fi
 gh api "repos/${source_repo}/commits/${ref}" --jq .sha > /dev/null 2>&1 \
   || die "commit ${ref} is not in ${source_repo}; push this checkout or pass --ref with a pushed commit"
 if [[ "$update_pin" == "false" ]]; then
-  gh api "repos/${source_repo}/contents/.github/workflows/pr-management.yml?ref=${ref}" --jq .path > /dev/null 2>&1 \
-    || die "commit ${ref} has no .github/workflows/pr-management.yml; use a commit that includes the shared workflows"
+  shared=pr-management.yml
+  [[ "$issues" == "false" ]] || shared=issue-management.yml
+  gh api "repos/${source_repo}/contents/.github/workflows/${shared}?ref=${ref}" --jq .path > /dev/null 2>&1 \
+    || die "commit ${ref} has no .github/workflows/${shared}; use a commit that includes the shared workflows"
 fi
 
 templates="$here/adopt-ci-templates"
 workflows=(pr-management check-pr-management pr-labelling sync-labels)
+[[ "$issues" == "false" ]] || workflows=(issue-management check-issue-management)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
@@ -150,9 +167,62 @@ Opened with \`scripts/adopt-ci.sh\`. The config check runs on this PR without a 
 EOF
 }
 
-# --update-pin recognises a pinned reference by its shape alone: a `uses:` value that names pr-management and ends in @
-# and a full commit SHA. That covers the action and each shared workflow, from any source, with no list to keep up to date.
-pin_re='[^[:space:]]*pr-management[^[:space:]@]*@[0-9a-f]{40}'
+issue_body() {
+  cat << EOF
+## What this does
+
+Adds the shared issue management from [${source_repo}](https://github.com/${source_repo}/tree/${ref}/.github/actions/issue-management),
+pinned to commit \`${ref}\`. The two workflow files added here are short callers: they say when to run and what
+permissions to grant, and call the shared workflows \`issue-management.yml\` and \`issue-management-validate.yml\` in
+${source_repo}, which hold the logic, the trusted checkout and the token.
+
+- **Possibly resolved**: labels an issue \`possibly-resolved\` and asks for confirmation when a merged PR mentions it
+  without closing it, no open PR mentions it, and nobody has commented since. Never closes.
+- **Waiting on the reporter**: for an issue with a needs-info label and no reply from its author, warns with
+  \`stale-issue\` after 14 days and closes as not planned after 14 more. **This is the only rule that closes.** A reply
+  from the reporter resets it.
+- **Idle and untriaged**: off until \`triage_label\` is set. Then labels \`stale-issue\` after 180 days without human
+  activity and lists the oldest untriaged issues in the run summary. Never closes.
+
+Issues with an exempt label or a milestone are never labelled or closed, and any human comment removes \`stale-issue\`
+and \`possibly-resolved\`. \`stale-issue\` is not \`stale\`, so it never mixes with PR stale handling.
+
+## Nothing changes when this merges
+
+The scheduled run is a **preview**: it writes what it would do to the job summary and changes nothing. A repository
+admin turns it on afterwards.
+
+**Before the switch**
+
+1. Run **Issue management** from the Actions tab with dry run on, and read the job summary.
+2. Edit \`.github/issue-management.json\` for the repository: the labels that mean "waiting on the reporter"
+   (\`needs_info_labels\`), the labels that exempt an issue (\`exempt_labels\`), and, if you triage with a label,
+   \`triage_label\` and \`priority_prefix\`. No label needs creating by hand.
+3. If the organisation restricts which actions may run (Settings, Actions, General), allow \`${source_repo}@*\`.
+
+**The switch**: set the repository variable \`ISSUE_AUTOMATION_LIVE\` to \`true\` (Settings, Secrets and variables,
+Actions, Variables), or run \`gh variable set ISSUE_AUTOMATION_LIVE --body true --repo ${repo}\`. Creating a variable
+needs admin access. No PR is needed. It is separate from \`PR_AUTOMATION_LIVE\`.
+
+**After it**: the daily run changes at most 30 issues. Setting the variable to \`false\`, or deleting it, returns it to
+preview.
+
+## Keeping it current
+
+The shared workflows are pinned to a full commit SHA so they never change under you. To update, change the SHA in the
+two workflow files (a Dependabot \`github-actions\` entry does this for you), or run
+\`scripts/adopt-ci.sh --update-pin ${repo}\` from ${source_repo}, which opens a PR that changes only those lines.
+
+$(overlap_section)
+
+Opened with \`scripts/adopt-ci.sh --issues\`. The config check runs on this PR without a token.
+EOF
+}
+
+# --update-pin recognises a pinned reference by its shape alone: a `uses:` value that names pr-management or
+# issue-management and ends in @ and a full commit SHA. That covers each action and shared workflow, from any source,
+# with no list to keep up to date.
+pin_re='[^[:space:]]*(pr|issue)-management[^[:space:]@]*@[0-9a-f]{40}\'
 
 md_list() { # lines on stdin become a Markdown list of code spans
   # The backticks are Markdown, not command substitution.
@@ -170,7 +240,7 @@ pin_body() { # old pins, new pins, changed files (each one per line)
   cat << EOF
 ## What this does
 
-Moves the pinned reference to the shared PR automation to commit \`${ref}\` of ${source_repo}. Only the \`uses:\`
+Moves the pinned references to the shared CI automation (pr-management, issue-management) to commit \`${ref}\` of ${source_repo}. Only the \`uses:\`
 lines in the files below change. The config files and every other line of the workflows stay as they are.
 
 Files:
@@ -218,13 +288,13 @@ update_pins() { # runs in the clone
   local files old new f
   files=$(grep -lE "uses:[[:space:]]*${pin_re}" .github/workflows/* 2> /dev/null || true)
   if [[ -z "$files" ]]; then
-    echo "  does not use pr-management yet; run without --update-pin to adopt it"
+    echo "  does not use pr-management or issue-management yet; run without --update-pin to adopt it"
     return 0
   fi
   old=$(printf '%s\n' "$files" | pins_in)
   # Swap the owner/repo and the SHA; the path inside the repository stays as it is.
   printf '%s\n' "$files" | while IFS= read -r f; do
-    sed -E -i.bak "s#(uses:[[:space:]]*)[^/[:space:]]+/[^/[:space:]]+(/[^[:space:]@]*pr-management[^[:space:]@]*)@[0-9a-f]{40}#\1${source_repo}\2@${ref}#" "$f" \
+    sed -E -i.bak "s#(uses:[[:space:]]*)[^/[:space:]]+/[^/[:space:]]+(/[^[:space:]@]*(pr|issue)-management[^[:space:]@]*)@[0-9a-f]{40}#\1${source_repo}\2@${ref}#" "$f" \
       && rm -f "$f.bak"
   done
   if git diff --quiet; then
@@ -235,9 +305,9 @@ update_pins() { # runs in the clone
   [[ "$dry_run" == "false" ]] || { echo "  dry run: nothing pushed"; return 0; }
   new=$(printf '%s\n' "$files" | pins_in)
   git add -- .github/workflows
-  git commit --quiet -s -m "ci: update the pr-management pin" -m "Points the PR automation at ${source_repo} at ${ref}."
+  git commit --quiet -s -m "ci: update the shared automation pin" -m "Points the shared automation at ${source_repo} at ${ref}."
   pin_body "$old" "$new" "$(git diff --name-only HEAD~1)" > "$tmp/body.md"
-  publish "ci: update the pr-management pin"
+  publish "ci: update the shared automation pin"
 }
 
 add_file() { # source, destination (relative to repo root); never overwrites
@@ -256,7 +326,7 @@ adopt() {
   local repo="$1" default_branch writable work
   echo "== $repo"
   [[ "$(gh api "repos/${repo}" --jq .archived)" == "false" ]] || { echo "  archived, skipped"; return 0; }
-  if [[ "$update_pin" == "false" ]]; then
+  if [[ "$update_pin" == "false" && "$issues" == "false" ]]; then
     # The team must exist in the repository's own organisation: a mention of any other name notifies nobody.
     team_org=$(printf '%s' "${reviewers#@}" | cut -d/ -f1 | tr '[:upper:]' '[:lower:]')
     team_slug="${reviewers##*/}"
@@ -281,6 +351,23 @@ adopt() {
       exit 0
     fi
     added=()
+    if [[ "$issues" == "true" ]]; then
+      overlap=$(grep -lE 'actions/stale|probot/stale|stale-issue|close-stale|stale-bot' .github/workflows/* 2> /dev/null || true)
+      if [[ -n "$overlap" ]]; then
+        echo "  warning: existing workflows overlap with this automation; retire one before switching it on:" >&2
+        printf '%s\n' "$overlap" | sed 's/^/    /' >&2
+      fi
+      for name in "${workflows[@]}"; do add_file "$templates/workflows/$name.yaml" ".github/workflows/$name.yaml"; done
+      add_file "$templates/issue-management.json" .github/issue-management.json
+      [[ ${#added[@]} -gt 0 ]] || { echo "  already adopted, nothing to add"; exit 0; }
+      [[ "$dry_run" == "false" ]] || { echo "  dry run: nothing pushed"; exit 0; }
+      git add -- "${added[@]}"
+      git commit --quiet -s -m "ci: adopt the shared issue management" \
+        -m "Pins ${source_repo}/.github/actions/issue-management at ${ref}."
+      issue_body > "$tmp/body.md"
+      publish "ci: adopt the shared issue management" || exit 1
+      exit 0
+    fi
     overlap=$(grep -lE 'needs-author-action|ready-for-review|actions/stale|actions/labeler' .github/workflows/* 2> /dev/null || true)
     if [[ -n "$overlap" ]]; then
       echo "  warning: existing workflows overlap with this automation; retire one before switching it on:" >&2

@@ -5,12 +5,14 @@ on:
     paths:
       - .github/actions/issue-management/**
       - .github/workflows/issue-management.yml
+      - .github/workflows/issue-management-validate.yml
       - .github/workflows/test-issue-management.yml
   push:
     branches: [main]
     paths:
       - .github/actions/issue-management/**
       - .github/workflows/issue-management.yml
+      - .github/workflows/issue-management-validate.yml
       - .github/workflows/test-issue-management.yml
 
 permissions:

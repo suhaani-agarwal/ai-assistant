@@ -6,18 +6,18 @@ The rules, configured in the repository's issue-management.json (every key is op
 
   possibly-resolved    A merged PR references the issue without closing it and nobody commented since the
                        merge. Labels and comments; never closes.
-  waiting-on-reporter  An issue with a needs-info label and no reply from its author. Warns with `stale`, then
+  waiting-on-reporter  An issue with a needs-info label and no reply from its author. Warns with `stale-issue`, then
                        closes as not planned. The only rule that closes.
   idle-untriaged       An untriaged issue with no priority and no human activity for a long time. Labels with
-                       `stale` and comments; never closes. Off unless triage_label is set.
+                       `stale-issue` and comments; never closes. Off unless triage_label is set.
 
-Any human comment after `stale` or `possibly-resolved` removes it, and a reply from the reporter removes the
+Any human comment after `stale-issue` or `possibly-resolved` removes it, and a reply from the reporter removes the
 needs-info label so a later request starts a fresh clock. Exempt labels and milestoned issues are never labelled or
 closed. The script stores no state: labels and timelines are the state.
 
 With triage_label set, the report also lists the oldest untriaged issues, so someone on triage duty has a queue.
 
-Dry-run unless DRY_RUN is the string false. Prints a Markdown report on stdout.
+Dry-run unless DRY_RUN is the string false. With VALIDATE=true it only checks the config. Prints a Markdown report on stdout.
 Exit codes: 0 on success, 1 on an error.
 """
 
@@ -31,7 +31,8 @@ import sys
 import time
 
 DEFAULTS = {
-    "stale_label": "stale",
+    # Not `stale`: PR automation owns that label, and a PR and an issue should never share one.
+    "stale_label": "stale-issue",
     "resolved_label": "possibly-resolved",
     # Empty disables the idle-untriaged rule, so only repositories that triage with a label opt in.
     "triage_label": "",
@@ -46,7 +47,7 @@ DEFAULTS = {
     "digest_limit": 25,
     "warning_comment": (
         "This issue is waiting on more information from the reporter and has had no reply. It will be closed in "
-        "{days} days unless there is a response. Any comment removes the `stale` label."
+        "{days} days unless there is a response. Any comment removes the `{label}` label."
     ),
     "close_comment": (
         "Closing as not planned: no reply from the reporter for {days} days. Please reopen with the requested "
@@ -54,23 +55,23 @@ DEFAULTS = {
     ),
     "resolved_comment": (
         "A merged PR (#{pr}) references this issue but did not close it, and nothing has been said since. Is this "
-        "resolved? A maintainer or the reporter can close it, or comment to remove the `possibly-resolved` label."
+        "resolved? A maintainer or the reporter can close it, or comment to remove the `{label}` label."
     ),
     "idle_comment": (
         "This issue has had no activity for {days} days and has not been triaged. A maintainer should set a "
-        "priority or close it. Any comment removes the `stale` label."
+        "priority or close it. Any comment removes the `{label}` label."
     ),
 }
 LIST_KEYS = {"needs_info_labels", "exempt_labels"}
 DAY_KEYS = {"warning_days", "close_days", "idle_days", "resolved_grace_days"}
 COMMENT_FIELDS = {
-    "warning_comment": {"days"},
+    "warning_comment": {"days", "label"},
     "close_comment": {"days"},
-    "resolved_comment": {"pr"},
-    "idle_comment": {"days"},
+    "resolved_comment": {"pr", "label"},
+    "idle_comment": {"days", "label"},
 }
 LABEL_INFO = {
-    "stale": ("CFD3D7", "No activity, or waiting on the reporter"),
+    "stale-issue": ("CFD3D7", "Issue with no activity, or waiting on the reporter"),
     "possibly-resolved": ("0E8A16", "A merged PR references this issue; needs confirmation that it is resolved"),
 }
 
@@ -258,14 +259,14 @@ def decide(issue, now, cfg):
             if stale_at and days(stale_at) >= cfg["close_days"]:
                 actions.append(("close", cfg["close_comment"].format(days=cfg["warning_days"] + cfg["close_days"])))
             elif not stale_at and days(asked) >= cfg["warning_days"]:
-                actions.append(("label", cfg["stale_label"], cfg["warning_comment"].format(days=cfg["close_days"])))
+                actions.append(("label", cfg["stale_label"], cfg["warning_comment"].format(days=cfg["close_days"], label=cfg["stale_label"])))
         return actions
 
     # Rule: possibly resolved. Never closes.
     if cfg["resolved_label"] not in labels and not has_open_reference(issue):
         for number, merged in sorted(merged_references(issue), key=lambda r: r[1], reverse=True):
             if days(merged) >= cfg["resolved_grace_days"] and activity < merged:
-                actions.append(("label", cfg["resolved_label"], cfg["resolved_comment"].format(pr=number)))
+                actions.append(("label", cfg["resolved_label"], cfg["resolved_comment"].format(pr=number, label=cfg["resolved_label"])))
                 return actions
 
     # Rule: idle and untriaged. Never closes. Off unless the repository names its triage label.
@@ -276,7 +277,7 @@ def decide(issue, now, cfg):
         and not (cfg["priority_prefix"] and any(n.startswith(cfg["priority_prefix"]) for n in labels))
         and days(activity) >= cfg["idle_days"]
     ):
-        actions.append(("label", cfg["stale_label"], cfg["idle_comment"].format(days=days(activity))))
+        actions.append(("label", cfg["stale_label"], cfg["idle_comment"].format(days=days(activity), label=cfg["stale_label"])))
     return actions
 
 
@@ -323,6 +324,15 @@ def describe(action):
 
 
 def main():
+    if os.environ.get("VALIDATE") == "true":
+        # Parses the config only: no API call and no token, so it is safe on a pull request from a fork.
+        try:
+            load_config(Path(os.environ.get("ISSUE_CONFIG", ".github/issue-management.json")))
+        except (ValueError, OSError) as err:
+            print(f"::error title=Invalid issue-management config::{type(err).__name__}: {err}")
+            return 1
+        print("issue-management config is valid")
+        return 0
     dry_run = os.environ.get("DRY_RUN", "true")
     if dry_run not in ("true", "false"):
         log("DRY_RUN must be true or false")

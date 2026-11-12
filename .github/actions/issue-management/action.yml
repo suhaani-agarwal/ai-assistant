@@ -10,13 +10,19 @@ inputs:
   max-actions:
     description: With dry-run false, the most issues one run changes
     default: '30'
+  validate:
+    description: Only check the configuration, offline; no token or API access is used
+    default: 'false'
 runs:
   using: composite
   steps:
     - name: Check runtime tools
       shell: bash
+      env:
+        VALIDATE: ${{ inputs.validate }}
       run: |
         for tool in python3 gh; do
+          [[ "$tool" == "gh" && "$VALIDATE" == "true" ]] && continue
           command -v "$tool" > /dev/null || { echo "::error::Required tool '$tool' not found"; exit 1; }
         done
     - name: Run shared issue management
@@ -25,4 +31,5 @@ runs:
         ISSUE_CONFIG: ${{ inputs.config }}
         DRY_RUN: ${{ inputs.dry-run }}
         MAX_ACTIONS: ${{ inputs.max-actions }}
+        VALIDATE: ${{ inputs.validate }}
       run: python3 "$GITHUB_ACTION_PATH/run.py" >> "$GITHUB_STEP_SUMMARY"

@@ -66,23 +66,23 @@ def decide(i):
 class WaitingOnReporter(unittest.TestCase):
     def test_warns_after_warning_days(self):
         acts = decide(issue(["needs-info"], events=[("label", "needs-info", 15)]))
-        self.assertEqual([(a[0], a[1]) for a in acts], [("label", "stale")])
+        self.assertEqual([(a[0], a[1]) for a in acts], [("label", "stale-issue")])
 
     def test_no_action_before_warning_days(self):
         self.assertEqual(decide(issue(["needs-info"], events=[("label", "needs-info", 5)])), [])
 
     def test_closes_after_stale_period(self):
-        i = issue(["needs-info", "stale"], events=[("label", "needs-info", 40), ("label", "stale", 15)])
+        i = issue(["needs-info", "stale-issue"], events=[("label", "needs-info", 40), ("label", "stale-issue", 15)])
         self.assertEqual([a[0] for a in decide(i)], ["close"])
 
     def test_no_close_before_stale_period(self):
-        i = issue(["needs-info", "stale"], events=[("label", "needs-info", 40), ("label", "stale", 5)])
+        i = issue(["needs-info", "stale-issue"], events=[("label", "needs-info", 40), ("label", "stale-issue", 5)])
         self.assertEqual(decide(i), [])
 
     def test_reporter_reply_resets(self):
-        i = issue(["needs-info", "stale"], comments=[(3, USER)],
-                  events=[("label", "needs-info", 40), ("label", "stale", 15)])
-        self.assertEqual(decide(i), [("unlabel", "stale"), ("unlabel", "needs-info")])
+        i = issue(["needs-info", "stale-issue"], comments=[(3, USER)],
+                  events=[("label", "needs-info", 40), ("label", "stale-issue", 15)])
+        self.assertEqual(decide(i), [("unlabel", "stale-issue"), ("unlabel", "needs-info")])
 
     def test_reply_removes_needs_info_even_when_exempt(self):
         i = issue(["needs-info", "no-stale"], comments=[(3, USER)], events=[("label", "needs-info", 20)])
@@ -92,7 +92,7 @@ class WaitingOnReporter(unittest.TestCase):
         # Asked 60 days ago, answered 50 days ago, asked again 20 days ago with no reply since.
         i = issue(["needs-info"], comments=[(50, USER)],
                   events=[("label", "needs-info", 60), ("label", "needs-info", 20)])
-        self.assertEqual([(a[0], a[1]) for a in decide(i)], [("label", "stale")])
+        self.assertEqual([(a[0], a[1]) for a in decide(i)], [("label", "stale-issue")])
 
     def test_maintainer_comment_is_not_a_reply(self):
         i = issue(["needs-info"], comments=[(10, MAINT)], events=[("label", "needs-info", 15)])
@@ -100,14 +100,14 @@ class WaitingOnReporter(unittest.TestCase):
 
     def test_stale_from_another_rule_does_not_close(self):
         # Idle-untriaged marked it stale 100 days ago; needs-info was asked 20 days ago with no reply.
-        i = issue(["needs-info", "stale"], events=[("label", "stale", 100), ("label", "needs-info", 20)])
+        i = issue(["needs-info", "stale-issue"], events=[("label", "stale-issue", 100), ("label", "needs-info", 20)])
         acts = decide(i)
         self.assertEqual([a[0] for a in acts], ["unlabel", "label"])
         self.assertTrue(all(a[0] != "close" for a in acts))
 
     def test_exempt_never_closes(self):
-        i = issue(["needs-info", "stale", "release-high"],
-                  events=[("label", "needs-info", 40), ("label", "stale", 15)])
+        i = issue(["needs-info", "stale-issue", "release-high"],
+                  events=[("label", "needs-info", 40), ("label", "stale-issue", 15)])
         self.assertEqual(decide(i), [])
 
 
@@ -148,7 +148,7 @@ class PossiblyResolved(unittest.TestCase):
 class IdleUntriaged(unittest.TestCase):
     def test_labels_idle_untriaged(self):
         acts = decide(issue(["triage"], created=200))
-        self.assertEqual([(a[0], a[1]) for a in acts], [("label", "stale")])
+        self.assertEqual([(a[0], a[1]) for a in acts], [("label", "stale-issue")])
 
     def test_recent_activity(self):
         self.assertEqual(decide(issue(["triage"], created=200, comments=[(10, MAINT)])), [])
@@ -163,7 +163,7 @@ class IdleUntriaged(unittest.TestCase):
         self.assertEqual(decide(issue(["triage", "no-stale"], created=400)), [])
 
     def test_never_closes(self):
-        acts = decide(issue(["triage", "stale"], created=900, events=[("label", "stale", 400)]))
+        acts = decide(issue(["triage", "stale-issue"], created=900, events=[("label", "stale-issue", 400)]))
         self.assertTrue(all(a[0] != "close" for a in acts))
 
 
@@ -235,13 +235,57 @@ class Config(unittest.TestCase):
             self.load({"stale_label": ""})
 
 
+class StaleLabel(unittest.TestCase):
+    def test_default_is_not_the_pr_label(self):
+        self.assertEqual(lifecycle.DEFAULTS["stale_label"], "stale-issue")
+
+    def test_pr_stale_label_is_left_alone(self):
+        # An issue carrying `stale` (a PR-style or legacy label) is not ours: no removal, no close.
+        i = issue(["needs-info", "stale"], comments=[(3, MAINT)],
+                  events=[("label", "needs-info", 40), ("label", "stale", 20)])
+        self.assertEqual([(a[0], a[1]) for a in decide(i)], [("label", "stale-issue")])
+
+    def test_comments_name_the_configured_label(self):
+        cfg = {**CFG, "stale_label": "no-activity"}
+        acts = lifecycle.decide(issue(["needs-info"], events=[("label", "needs-info", 20)]), NOW, cfg)
+        self.assertIn("`no-activity`", acts[0][2])
+
+
+class Validate(unittest.TestCase):
+    def run_main(self, content):
+        import contextlib, io, os
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(content)
+            old = {k: os.environ.get(k) for k in ("VALIDATE", "ISSUE_CONFIG")}
+            os.environ.update(VALIDATE="true", ISSUE_CONFIG=str(path))
+            try:
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    code = lifecycle.main()
+            finally:
+                for k, v in old.items():
+                    os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        return code, out.getvalue()
+
+    def test_valid_config(self):
+        self.assertEqual(self.run_main('{"idle_days": 90}')[0], 0)
+
+    def test_invalid_config_fails_without_api_access(self):
+        code, out = self.run_main('{"idle_days": 0}')
+        self.assertEqual(code, 1)
+        self.assertIn("::error", out)
+
+    def test_malformed_json_fails(self):
+        self.assertEqual(self.run_main("{")[0], 1)
+
+
 class OptIn(unittest.TestCase):
     def test_idle_rule_off_by_default(self):
         i = issue(["triage"], created=400)
         self.assertEqual(lifecycle.decide(i, NOW, lifecycle.DEFAULTS), [])
 
     def test_defaults_do_not_exempt_priority_labels(self):
-        i = issue(["needs-info", "stale", "release-high"], events=[("label", "needs-info", 40), ("label", "stale", 15)])
+        i = issue(["needs-info", "stale-issue", "release-high"], events=[("label", "needs-info", 40), ("label", "stale-issue", 15)])
         self.assertEqual([a[0] for a in lifecycle.decide(i, NOW, lifecycle.DEFAULTS)], ["close"])
 
 

@@ -1,7 +1,7 @@
 name: marker test
 on:
-  push:
-    branches: [test/marker-run]
+  pull_request:
+    branches: [test/marker-base]
 permissions:
   contents: read
   pull-requests: write

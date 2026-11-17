@@ -68,21 +68,9 @@ Three independent layers. Take one, or all of them:
 The layers share data: the CI actions label things in a fixed way, and the assistants read those labels instead of
 recomputing them. A repository that runs the actions gives the maintainer assistant its signals for free.
 
-```
- your machine
- ┌─────────────────────────────────────────────────────────────────────────────┐
- │  you ──► the launcher ──► OpenShell gateway   (holds your GitHub token and  │
- │          (from the image)  any model API key, outside the sandbox; an       │
- │                            allowlist proxy decides what it may reach)       │
- │                                     │                                       │
- │            ┌────────────────────────▼───────────────────────────────┐       │
- │            │ SANDBOX: Hermes + a profile (maintainer or contributor)│       │
- │            │ skills · plugins · memory · a terminal for coding      │       │
- │            └────────────────────────────────────────────────────────┘       │
- └──────────────────────────────────────┬──────────────────────────────────────┘
-                                        ▼
-                  GitHub (read APIs, the GitHub MCP server) · GitHub Copilot or your model
-```
+![Where each piece runs: the OpenShell gateway on your laptop, the sandbox and supervisor containers in Docker, and the listed services outside](public/highlevel_arch.png)
+
+*Where each piece runs. The gateway is a background service on your laptop; the sandbox and its supervisor are two Docker containers.*
 
 ## Key features
 
@@ -566,10 +554,6 @@ and [`docs/architecture.md`](docs/architecture.md).
 The agent runs in an [OpenShell](https://github.com/NVIDIA/OpenShell) sandbox, and OpenShell enforces its limits **from
 outside it, where the agent cannot edit them.** That is what lets you run it next to private work, and what makes a tricked
 agent harmless: it has nothing to steal and nowhere to send it.
-
-![Where each piece runs: the OpenShell gateway on your laptop, the sandbox and supervisor containers in Docker, and the listed services outside](public/highlevel_arch.png)
-
-*Where each piece runs. The gateway is a background service on your laptop; the sandbox and its supervisor are two Docker containers.*
 
 - **It cannot see your computer.** Nothing is mounted into the sandbox: not your files, your other projects, your employer's
   code, your SSH keys or your browser sessions.

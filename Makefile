@@ -34,8 +34,8 @@ image: ## Build the local sandbox image (override IMAGE and TAG as needed)
 
 test: image ## Build and run the Dockerfile's offline integration checks
 
-unit: ## Run the plugin and hook tests (Python and PyYAML only)
-	python3 -m unittest discover -s tests/plugins && python3 -m unittest discover -s tests/hooks
+unit: ## Run the plugin, hook and workflow-script tests (Python and PyYAML only)
+	python3 -m unittest discover -s tests/plugins && python3 -m unittest discover -s tests/hooks && python3 -m unittest discover -s tests/workflows
 
 image-check: image ## Build the image and run tests/image/run.sh against it
 	tests/image/run.sh $(IMAGE):$(TAG)

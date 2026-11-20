@@ -1,4 +1,4 @@
-# Runs the plugin and hook tests (tests/plugins, tests/hooks) on every pull request that touches what they test. They need
+# Runs the plugin, hook and workflow-script tests (tests/plugins, tests/hooks, tests/workflows) on every pull request that touches what they test. They need
 # only Python and PyYAML: no Docker, no network, no Hermes.
 name: test-plugins
 
@@ -12,6 +12,8 @@ on:
       - "scripts/adopt-ci.sh"
       - "tests/plugins/**"
       - "tests/hooks/**"
+      - "tests/workflows/**"
+      - "workflows/**"
       - "tests/fixtures/**"
       - "tests/requirements.txt"
       - ".github/workflows/test-plugins.yml"
@@ -25,6 +27,8 @@ on:
       - "scripts/adopt-ci.sh"
       - "tests/plugins/**"
       - "tests/hooks/**"
+      - "tests/workflows/**"
+      - "workflows/**"
       - "tests/fixtures/**"
       - "tests/requirements.txt"
       - ".github/workflows/test-plugins.yml"
@@ -54,3 +58,8 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: python3 -m unittest discover -s tests/hooks -v
+
+      - name: Workflow script tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s tests/workflows -v

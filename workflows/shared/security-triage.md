@@ -137,6 +137,9 @@ safe-outputs:
       description: >-
         Record the triage verdict for one advisory. Call it once per advisory listed in the run, never for any other.
       runs-on: ubuntu-latest
+      # gh-aw keeps only the first call of a safe-output job unless max says otherwise. The posting step caps at the
+      # limit again, against the advisories collect handed over.
+      max: ${{ github.aw.import-inputs.limit }}
       output: "Verdict recorded."
       inputs:
         ghsa_id:

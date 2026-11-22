@@ -178,7 +178,7 @@ mcp-scripts:
   lab-reset:
     description: >-
       Delete the lab cluster and create a fresh, empty one (about a minute). Use it before switching releases and
-      between advisories, so nothing from one attempt leaks into the next. Optionally pick the Kubernetes version.
+      between advisories, so nothing from one attempt carries into the next. Optionally pick the Kubernetes version.
     inputs:
       k8s_version:
         type: string
@@ -207,7 +207,7 @@ mcp-scripts:
   lab-kubectl:
     description: >-
       Run one kubectl command against the lab cluster, e.g. `apply -f -` with the manifest in stdin, `get pods -A`,
-      `auth can-i get secrets -n victim --as=system:serviceaccount:tenant:attacker`, or `logs -n kyverno deploy/x`.
+      `auth can-i get secrets -n other --as=system:serviceaccount:tenant:probe-user`, or `logs -n kyverno deploy/x`.
       Impersonate users with --as. Manifests go in stdin, never as a file path. Returns the exit code and output.
     inputs:
       args:
@@ -238,11 +238,11 @@ controller crashing. Use the CLI for what the CLI can show on its own.
 
 How to use it:
 
-1. Build only what the report needs: the attacker's account with exactly the permissions the report says they
-   have, a separate namespace for anything the attacker should not reach, and a canary value of your own (for
-   example a Secret or ConfigMap holding `canary-<random>`) so that "it leaked" or "it changed" is something you can
-   see, not something you infer. Check the attacker's limits with `auth can-i` before the attack.
-2. Install the version the report names, run the attack as the report describes, and record what you observe:
+1. Build only what the report needs: a `probe-*` service account with exactly the permissions the report says the
+   user has, a separate namespace for anything that user should not reach, and a canary value of your own (for
+   example a Secret or ConfigMap holding `canary-<random>`) so that "the value appeared" or "it changed" is
+   something you can see, not something you infer. Check the account's limits with `auth can-i` first.
+2. Install the version the report names, follow the report's steps as that account, and record what you observe:
    denials, the canary showing up where it should not, a resource changed, a controller restarting
    (`get pods -n <namespace>` restart counts and `logs --previous`).
 3. Then `lab-reset`, install `latest`, and repeat, so you can say whether it still happens. If the report names a

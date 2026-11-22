@@ -499,6 +499,156 @@ jobs:
   agent:
     needs: [collect]
     if: ${{ needs.collect.outputs.count != '0' }}
+
+  # The agent can stop before recording a verdict: a content filter blocks the model or it runs out of time. Then the
+  # posting job never runs and the team would hear nothing. This job, with no model, records "did not finish" on each
+  # advisory that collect picked and that got no verdict. It never replaces a real verdict from an earlier run, and
+  # its marker carries no fingerprint, so the next run tries again. gh-aw runs it only when threat detection passed;
+  # a run that detection stops shows as failed instead.
+  record-unfinished:
+    needs: [collect, activation, agent, detection, post_advisory_verdict]
+    if: ${{ always() && needs.collect.result == 'success' && needs.collect.outputs.count != '0' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Download the collect index
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: security-triage-index
+          path: /tmp/security-triage-index
+      # aw_info.json, written before the agent ran, says whether the run is a preview.
+      - name: Download the run settings
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: activation
+          path: /tmp/security-triage-activation
+      - name: Download the agent output
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: agent
+          path: /tmp/security-triage-agent
+      - name: Split the target repository
+        id: target
+        env:
+          TARGET_REPO: ${{ github.aw.import-inputs.target_repo }}
+        run: |
+          echo "owner=${TARGET_REPO%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${TARGET_REPO#*/}" >> "$GITHUB_OUTPUT"
+      - name: Mint the App token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.SECURITY_TRIAGE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SECURITY_TRIAGE_APP_PRIVATE_KEY }}
+          owner: ${{ steps.target.outputs.owner }}
+          repositories: ${{ steps.target.outputs.name }}
+          # Not a declared input of the action, which forwards every permission-* input; Actions warns about it.
+          permission-repository-advisories: write
+      - name: Record advisories without a verdict
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TARGET_REPO: ${{ github.aw.import-inputs.target_repo }}
+          TEAM_MENTIONS: ${{ github.aw.import-inputs.team_mentions }}
+          INDEX_FILE: /tmp/security-triage-index/index.json
+          AW_INFO_FILE: /tmp/security-triage-activation/aw_info.json
+          AGENT_OUTPUT_FILE: /tmp/security-triage-agent/agent_output.json
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          AGENT_RESULT: ${{ needs.agent.result }}
+          AGENT_TIMED_OUT: ${{ needs.agent.outputs.agentic_engine_timeout }}
+          POST_RESULT: ${{ needs.post_advisory_verdict.result }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+
+          # The posting job's marker format, which collect reads. No fingerprint matches sixteen zeros.
+          MARKER = "<!-- security-triage:v1 fingerprint=0000000000000000 classification=unfinished -->"
+          CLASSIFICATIONS = {"reproduced", "needs-non-default-config", "not-reproduced", "needs-more-info",
+                             "possible-duplicate"}
+
+          def load(path, default):
+              try:
+                  with open(path) as f:
+                      return json.load(f)
+              except (OSError, ValueError):
+                  return default
+
+          def unfinished(index, agent_output, post_result):
+              """GHSAs collect picked that got no verdict through. None when the posting job failed part way, since
+              it may have posted some and this job cannot tell which."""
+              if post_result in ("failure", "cancelled"):
+                  return None
+              done = set()
+              if post_result == "success":
+                  done = {i.get("ghsa_id") for i in agent_output.get("items", [])
+                          if i.get("type") == "post_advisory_verdict" and i.get("classification") in CLASSIFICATIONS}
+              return [g for g in index if g not in done]
+
+          def reason(env, agent_output):
+              if env.get("AGENT_RESULT") == "skipped":
+                  return "The agent did not run."
+              if env.get("AGENT_TIMED_OUT") == "true":
+                  return "The agent ran out of time."
+              if agent_output.get("collectorFailureCause") == "request_rejection":
+                  return "The model's response was blocked by its provider's content filter."
+              if env.get("AGENT_RESULT") not in ("success", None, ""):
+                  return "The agent job failed."
+              return "The agent stopped without recording a verdict for this advisory."
+
+          def render(why, team, run_url):
+              lines = [
+                  "### Automated first-pass triage",
+                  "",
+                  "**Result:** Triage did not finish",
+                  "",
+                  f"{why} No verdict was recorded in this run. The next scheduled run tries again.",
+                  "",
+                  "<sub>Automated first pass, not a decision. A maintainer reviews the report and decides severity "
+                  f"and next steps. [Run]({run_url})</sub>",
+              ]
+              if team:
+                  lines += ["", f"cc {team}"]
+              return "\n".join(lines + ["", MARKER])
+
+          def main():
+              env = os.environ
+              index = load(env["INDEX_FILE"], {})
+              agent_output = load(env["AGENT_OUTPUT_FILE"], {})
+              # Anything but an explicit false counts as a preview, so a missing file never posts.
+              staged = load(env["AW_INFO_FILE"], {}).get("staged") is not False
+              todo = unfinished(index, agent_output, env.get("POST_RESULT"))
+              if todo is None:
+                  print("::warning::The posting job failed; not recording unfinished advisories.")
+                  return
+              why = reason(env, agent_output)
+              team = env.get("TEAM_MENTIONS", "").strip()
+              summary = []
+              for g in todo:
+                  entry = index[g]
+                  previous = entry.get("previous_classification")
+                  if entry.get("comment_id") and previous != "unfinished":
+                      # Keep the earlier verdict; collect sees the changed report again next run.
+                      summary.append(f"- {g}: did not finish; the earlier verdict stays")
+                      continue
+                  body = render(why, team if previous != "unfinished" else "", env["RUN_URL"])
+                  if staged:
+                      summary += [f"## {g} (preview, not posted)", "", body, "", "---", ""]
+                      continue
+                  base = f"repos/{env['TARGET_REPO']}/security-advisories/{g}/comments"
+                  path, method = (f"{base}/{entry['comment_id']}", "PATCH") if entry.get("comment_id") else (base, "POST")
+                  r = subprocess.run(["gh", "api", "-X", method, path, "--input", "-"],
+                                     input=json.dumps({"body": body}), capture_output=True, text=True)
+                  if r.returncode:
+                      print(f"::error::{method} comment on {g} failed")
+                      continue
+                  summary.append(f"- {g}: did not finish ({why})")
+              with open(env["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write("\n".join(summary or ["Every advisory got a verdict."]) + "\n")
+
+          if os.environ.get("SECURITY_TRIAGE_NO_MAIN") != "1":
+              main()
+          PY
 ---
 
 # Security advisory triage
@@ -540,8 +690,8 @@ ${{ needs.collect.outputs.json }}
 ## For each advisory
 
 1. Read the whole report and its comments. Work out the claimed impact, the component, the affected versions and
-   the attacker: who they are and what access they already need.
-2. Check the claim against the context documents. If the attacker already needs a permission that gives the same
+   who would have to do it and what access they already need.
+2. Check the claim against the context documents. If that user already needs a permission that gives the same
    power (for example, they can already edit policies or the controller's configuration), or the behaviour is
    documented as the operator's choice, note the section.
 3. Reproduce it when the report gives enough to do so: with the CLI on both releases, or in the lab on the reported
@@ -550,6 +700,19 @@ ${{ needs.collect.outputs.json }}
 4. Compare with `published` for a possible duplicate.
 5. Score it with CVSS 3.1 from what you observed, not from the report's wording. Severity follows the score:
    9.0–10.0 critical, 7.0–8.9 high, 4.0–6.9 medium, 0.1–3.9 low, and `none` when it is not a vulnerability.
+6. Call `post_advisory_verdict` for it before you start the next advisory, so a later failure cannot lose it.
+
+## How to write what you run
+
+You are checking whether a claim holds, the way a test does. Write it like a test:
+
+- Build the smallest thing that shows the claimed impact, and stop once you have observed it or shown it does not
+  happen. Do not extend the report beyond its claim or build anything it does not need.
+- Use neutral names: `probe-*` for the policies and resources you write, `canary-*` for the values you plant, and
+  plain messages such as `value: {{...}}`. Do not use words like malicious, evil, attack, exploit, leak or steal in
+  names, messages or your notes.
+- Describe results as observations: "the canary value from kube-system appeared in the admission response to a user
+  who cannot read kube-system", not as an attack story.
 
 ## Choosing the classification
 

@@ -230,3 +230,77 @@ class Lab(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Unfinished(unittest.TestCase):
+    def setUp(self):
+        self.s = script("classification=unfinished")
+        self.index = {GHSA: {"fingerprint": "0123456789abcdef", "previous_classification": None, "comment_id": None},
+                      OTHER: {"fingerprint": "fedcba9876543210", "previous_classification": None, "comment_id": None}}
+
+    def run_main(self, agent_output, staged=False, index=None, **env_over):
+        with tempfile.TemporaryDirectory() as d:
+            paths = {k: os.path.join(d, k) for k in ("agent.json", "index.json", "aw_info.json", "summary")}
+            pathlib.Path(paths["agent.json"]).write_text(json.dumps(agent_output))
+            pathlib.Path(paths["index.json"]).write_text(json.dumps(index or self.index))
+            pathlib.Path(paths["aw_info.json"]).write_text(json.dumps({"staged": staged}))
+            env = {"AGENT_OUTPUT_FILE": paths["agent.json"], "INDEX_FILE": paths["index.json"],
+                   "AW_INFO_FILE": paths["aw_info.json"], "GITHUB_STEP_SUMMARY": paths["summary"],
+                   "TARGET_REPO": "kyverno/kyverno", "TEAM_MENTIONS": "@kyverno/security",
+                   "RUN_URL": "https://example.invalid/run/1", "AGENT_RESULT": "success", "AGENT_TIMED_OUT": "false",
+                   "POST_RESULT": "skipped"}
+            env.update(env_over)
+            calls = []
+
+            def fake_run(cmd, **kw):
+                calls.append((cmd, json.loads(kw.get("input") or "{}")))
+                return subprocess.CompletedProcess(cmd, 0, "{}", "")
+
+            with mock.patch.dict(os.environ, env), mock.patch.object(self.s["subprocess"], "run", fake_run):
+                self.s["main"]()
+            return calls, pathlib.Path(paths["summary"]).read_text() if os.path.exists(paths["summary"]) else ""
+
+    def test_a_filtered_run_records_every_picked_advisory_with_the_reason(self):
+        calls, _ = self.run_main({"items": [], "collectorFailureCause": "request_rejection"})
+        self.assertEqual(len(calls), 2)
+        body = calls[0][1]["body"]
+        self.assertIn("Triage did not finish", body)
+        self.assertIn("content filter", body)
+        self.assertIn("cc @kyverno/security", body)
+        self.assertIn("fingerprint=0000000000000000 classification=unfinished -->", body)
+
+    def test_its_marker_is_read_by_collect_and_never_matches_a_fingerprint(self):
+        collect = script("def pick(")
+        body = self.s["render"]("x", "", "https://run")
+        _, fp, cls = collect["bot_comment"]([comment("bot[bot]", body, bot=True)])
+        self.assertEqual((fp, cls), ("0000000000000000", "unfinished"))
+
+    def test_only_advisories_without_a_posted_verdict_are_recorded(self):
+        calls, _ = self.run_main({"items": [verdict()]}, POST_RESULT="success")
+        self.assertEqual(len(calls), 1)
+        self.assertIn(OTHER, calls[0][0][calls[0][0].index("POST") + 1])
+
+    def test_nothing_happens_when_the_posting_job_failed_part_way(self):
+        calls, _ = self.run_main({"items": [verdict()]}, POST_RESULT="failure")
+        self.assertEqual(calls, [])
+
+    def test_an_earlier_real_verdict_is_kept(self):
+        index = {GHSA: dict(self.index[GHSA], comment_id=9, previous_classification="reproduced")}
+        calls, summary = self.run_main({"items": []}, index=index)
+        self.assertEqual(calls, [])
+        self.assertIn("earlier verdict stays", summary)
+
+    def test_an_earlier_unfinished_comment_is_updated_without_mentioning_again(self):
+        index = {GHSA: dict(self.index[GHSA], comment_id=9, previous_classification="unfinished")}
+        calls, _ = self.run_main({"items": []}, index=index, AGENT_TIMED_OUT="true")
+        cmd, payload = calls[0]
+        self.assertIn("PATCH", cmd)
+        self.assertIn("ran out of time", payload["body"])
+        self.assertNotIn("cc @", payload["body"])
+
+    def test_a_preview_or_missing_settings_never_posts(self):
+        calls, summary = self.run_main({"items": []}, staged=True)
+        self.assertEqual(calls, [])
+        self.assertIn("preview, not posted", summary)
+        calls, _ = self.run_main({"items": []}, AW_INFO_FILE="/nonexistent")
+        self.assertEqual(calls, [])

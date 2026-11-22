@@ -27,7 +27,18 @@ permissions:
   contents: read
   copilot-requests: write
 
+# The model the agent runs on. Pinned rather than `auto`: in tests on a re-filed advisory, claude-sonnet-5.5 got
+# furthest, while claude-opus-5.5 and gpt-6-sol refused the report text before running anything.
+engine:
+  id: copilot
+  model: claude-sonnet-5.5
+
 safe-outputs:
+  # Threat detection keeps its default `detection` model instead of inheriting the agent's.
+  threat-detection:
+    engine:
+      id: copilot
+      model: detection
   # Preview first: while this is on, each verdict is written to the run summary and nothing is posted on any
   # advisory. Compare a few weeks of previews with the security team's own triage, then delete this line, run
   # `gh aw compile` and commit to go live.

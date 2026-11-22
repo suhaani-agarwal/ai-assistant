@@ -242,11 +242,12 @@ How to use it:
    user has, a separate namespace for anything that user should not reach, and a canary value of your own (for
    example a Secret or ConfigMap holding `canary-<random>`) so that "the value appeared" or "it changed" is
    something you can see, not something you infer. Check the account's limits with `auth can-i` first.
-2. Install the version the report names, follow the report's steps as that account, and record what you observe:
-   denials, the canary showing up where it should not, a resource changed, a controller restarting
-   (`get pods -n <namespace>` restart counts and `logs --previous`).
-3. Then `lab-reset`, install `latest`, and repeat, so you can say whether it still happens. If the report names a
-   fixed release, trying that one too is the strongest check.
+2. Install the version the report names, follow the report's steps for its main claim as that account, and record
+   what you observe: denials, the canary showing up where it should not, a resource changed, a controller
+   restarting (`get pods -n <namespace>` restart counts and `logs --previous`). Record the verdict so far.
+3. Then `lab-reset`, install `latest`, and repeat the same claim, so you can say whether it still happens. Do this
+   before trying any further claim from the report. If the report names a fixed release, trying that one too is the
+   strongest check.
 4. `lab-reset` before moving to the next advisory.
 
 If a report needs something the lab cannot provide (a cloud provider, several nodes, an unreleased build, the

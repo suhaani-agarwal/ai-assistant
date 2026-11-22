@@ -517,7 +517,8 @@ jobs:
   # posting job never runs and the team would hear nothing. This job, with no model, records "did not finish" on each
   # advisory that collect picked and that got no verdict. It never replaces a real verdict from an earlier run, and
   # its marker carries no fingerprint, so the next run tries again. gh-aw runs it only when threat detection passed;
-  # a run that detection stops shows as failed instead.
+  # a run that detection stops, or whose detection model is itself refused, shows as failed and records nothing. The
+  # advisory keeps its old fingerprint, so the next run triages it again.
   record-unfinished:
     needs: [collect, activation, agent, detection, post_advisory_verdict]
     if: ${{ always() && needs.collect.result == 'success' && needs.collect.outputs.count != '0' }}
@@ -716,7 +717,13 @@ ${{ needs.collect.outputs.json }}
    documented as the operator's choice, note the section.
 3. Reproduce it when the report gives enough to do so: with the CLI on both releases, or in the lab on the reported
    release and the latest. Use the report's own policies and resources where it gives them, adapted only as far as
-   needed to run. Keep notes of each command, its exit code and the lines of output that matter.
+   needed to run. Keep notes of each command, its exit code and the lines of output that matter. Work in this order:
+   a. Pick the report's main claim: the one impact the rest depends on.
+   b. Reproduce that claim on the reported release.
+   c. Check the same claim on the latest release, before anything else.
+   d. Only then look at the report's further claims (for example that the same flaw also allows writes or
+      privilege escalation). Build one only if it would change the severity; otherwise reason from what you have
+      already shown, and say in the verdict which claims you ran and which you reasoned about.
 4. Compare with `published` for a possible duplicate.
 5. Score it with CVSS 3.1 from what you observed, not from the report's wording. Severity follows the score:
    9.0–10.0 critical, 7.0–8.9 high, 4.0–6.9 medium, 0.1–3.9 low, and `none` when it is not a vulnerability.
@@ -730,7 +737,8 @@ ${{ needs.collect.outputs.json }}
 You are checking whether a claim holds, the way a test does. Write it like a test:
 
 - Build the smallest thing that shows the claimed impact, and stop once you have observed it or shown it does not
-  happen. Do not extend the report beyond its claim or build anything it does not need.
+  happen. Do not extend the report beyond its claim or build anything it does not need. Prefer showing a read (a
+  canary value appearing) over building a write when either would prove the claim.
 - Use neutral names: `probe-*` for the policies and resources you write, `canary-*` for the values you plant, and
   plain messages such as `value: {{...}}`. Do not use words like malicious, evil, attack, exploit, leak or steal in
   names, messages or your notes.

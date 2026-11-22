@@ -14,21 +14,22 @@ from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SHARED = ROOT / "workflows" / "shared" / "security-triage.md"
+LAB = ROOT / "workflows" / "shared" / "security-triage-lab.md"
 GHSA = "GHSA-2c4m-59x9-fr2g"
 OTHER = "GHSA-4fvq-m3w5-p9qx"
 
 
-def script(marker: str) -> dict:
+def script(marker: str, path: pathlib.Path = SHARED) -> dict:
     """Run the inline Python block containing `marker` without calling main(), and return its globals."""
-    text = SHARED.read_text()
-    for block in re.findall(r"python3 - <<'PY'\n(.*?)\n\s*PY\n", text, re.S):
+    text = path.read_text()
+    for block in re.findall(r"<<'PY'\n(.*?)\n\s*PY\n", text, re.S):
         if marker in block:
             lines = block.splitlines()
             indent = min(len(l) - len(l.lstrip()) for l in lines if l.strip())
             source = "\n".join(l[indent:] for l in lines)
             scope = {"__name__": "security_triage"}
             with mock.patch.dict(os.environ, {"SECURITY_TRIAGE_NO_MAIN": "1"}):
-                exec(compile(source, str(SHARED), "exec"), scope)
+                exec(compile(source, str(path), "exec"), scope)
             return scope
     raise AssertionError(f"no inline script contains {marker!r}")
 
@@ -104,6 +105,13 @@ class Collect(unittest.TestCase):
         old = advisory(OTHER, created_at="2026-10-01T00:00:00Z")
         todo, _ = self.s["pick"]([advisory(), old], self.comments({}), 1)
         self.assertEqual([t["ghsa_id"] for t in todo], [OTHER])
+
+    def test_a_manual_run_triages_only_the_named_advisory_even_if_unchanged(self):
+        fp = self.s["fingerprint"](advisory(), [])
+        mine = comment("triage[bot]", f"<!-- security-triage:v1 fingerprint={fp} classification=reproduced -->", bot=True)
+        old = advisory(OTHER, created_at="2026-10-01T00:00:00Z")
+        todo, _ = self.s["pick"]([advisory(), old], self.comments({GHSA: [mine]}), 3, GHSA)
+        self.assertEqual([t["ghsa_id"] for t in todo], [GHSA])
 
     def test_long_descriptions_are_cut(self):
         todo, _ = self.s["pick"]([advisory(description="a" * 50000)], self.comments({}), 3)
@@ -188,6 +196,36 @@ class Post(unittest.TestCase):
         items = [verdict(ghsa_id=g) for g in index]
         calls, _ = self.run_main(items, staged=False, index=index)
         self.assertEqual(len(calls), 3)
+
+
+class Lab(unittest.TestCase):
+    def setUp(self):
+        self.s = script("def check_kubectl(", LAB)
+
+    def test_cluster_commands_with_stdin_manifests_and_impersonation_are_allowed(self):
+        ok = self.s["check_kubectl"]
+        self.assertEqual(ok("apply -f -")[:2], ["apply", "-f"])
+        self.assertEqual(ok("kubectl get secrets -n victim --as=system:serviceaccount:tenant:attacker")[0], "get")
+        self.assertEqual(ok("logs -n kyverno deploy/kyverno-admission-controller --previous --tail 200")[0], "logs")
+        self.assertEqual(ok("exec -n t pod -- cat -f /etc/hosts")[0], "exec")
+
+    def test_commands_that_reach_the_machine_or_another_cluster_are_refused(self):
+        for bad in ("cp pod:/x /tmp/x", "proxy", "port-forward svc/x 80", "config view", "plugin list",
+                    "apply -f /etc/passwd", "apply --filename=/etc/passwd", "apply -f/etc/passwd",
+                    "apply -f https://example.invalid/x.yaml", "get pods --kubeconfig=/root/.kube/config",
+                    "get pods -s https://10.0.0.1", "create secret generic x --from-file=/etc/shadow",
+                    "get pods -o go-template-file=/etc/passwd", "apply -k .", "logs -f deploy/x", ""):
+            with self.assertRaises(ValueError, msg=bad):
+                self.s["check_kubectl"](bad)
+
+    def test_chart_version_maps_an_app_release_and_latest_skips_prereleases(self):
+        entries = [{"version": "3.7.0-rc.1", "app_version": "v1.17.0-rc.1"}, {"version": "3.6.3", "app_version": "v1.16.3"},
+                   {"version": "3.6.1", "app_version": "v1.16.1"}]
+        cv = self.s["chart_version"]
+        self.assertEqual(cv("v1.16.1", entries), "3.6.1")
+        self.assertEqual(cv("1.16.3", entries), "3.6.3")
+        self.assertEqual(cv("latest", entries), "3.6.3")
+        self.assertIsNone(cv("v1.9.9", entries))
 
 
 if __name__ == "__main__":

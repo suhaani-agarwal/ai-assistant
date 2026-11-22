@@ -393,6 +393,8 @@ jobs:
           TARGET_REPO: ${{ github.aw.import-inputs.target_repo }}
           STATES: ${{ github.aw.import-inputs.states }}
           LIMIT: ${{ github.aw.import-inputs.limit }}
+          # Set by a manual run's ghsa_id input, if the workflow declares one: triage that advisory even if unchanged.
+          ONLY_GHSA: ${{ inputs.ghsa_id }}
         run: |
           python3 - <<'PY'
           import hashlib, json, os, re, subprocess
@@ -429,12 +431,15 @@ jobs:
                       return c, m.group(1), m.group(2)
               return None, None, None
 
-          def pick(advisories, comments_for, limit):
+          def pick(advisories, comments_for, limit, only=""):
+              """Advisories to triage and the index for the posting job. `only` triages that one even if unchanged."""
               todo, index = [], {}
               for adv in sorted(advisories, key=lambda a: a.get("created_at") or ""):
                   if len(todo) >= limit:
                       break
                   g = adv["ghsa_id"]
+                  if only and g != only:
+                      continue
                   comments = comments_for(g)
                   if comments is None:
                       continue
@@ -442,7 +447,7 @@ jobs:
                   reporter_comments = [c for c in comments if (c.get("user") or {}).get("login") == reporter]
                   fp = fingerprint(adv, reporter_comments)
                   mine, old_fp, old_cls = bot_comment(comments)
-                  if old_fp == fp:
+                  if old_fp == fp and not only:
                       continue
                   humans = [c for c in comments if (c.get("user") or {}).get("type") != "Bot"][-MAX_COMMENTS:]
                   todo.append({
@@ -463,10 +468,13 @@ jobs:
 
           def main():
               target, limit = os.environ["TARGET_REPO"], int(os.environ["LIMIT"])
+              only = (os.environ.get("ONLY_GHSA") or "").strip()
+              if only and not re.fullmatch(r"GHSA(-[23456789cfghjmpqrvwx]{4}){3}", only):
+                  raise SystemExit(f"::error::{only!r} is not a GHSA ID")
               advisories = []
               for state in json.loads(os.environ["STATES"]):
                   advisories += gh_list(f"repos/{target}/security-advisories?state={state}&per_page=100") or []
-              todo, index = pick(advisories, lambda g: gh_list(f"repos/{target}/security-advisories/{g}/comments?per_page=100"), limit)
+              todo, index = pick(advisories, lambda g: gh_list(f"repos/{target}/security-advisories/{g}/comments?per_page=100"), limit, only)
               published = [{"ghsa_id": a["ghsa_id"], "cve_id": a.get("cve_id"), "summary": a.get("summary"),
                             "severity": a.get("severity"), "cwe_ids": a.get("cwe_ids")}
                            for a in (gh_list(f"repos/{target}/security-advisories?state=published&per_page=100") or [])][:60]
@@ -525,8 +533,9 @@ ${{ needs.collect.outputs.json }}
   Read them once, before the first advisory. They say what the project treats as the operator's responsibility.
 - A scratch directory per advisory: `/tmp/gh-aw/security-triage/repro/<GHSA ID>/`. Write policies, resources and
   test files there with the edit tool.
-- No cluster and no network. If a report can only be reproduced against a live cluster, controller or external
-  service, say so in your verdict and reason from the code paths the report names and the CLI's behaviour.
+- No network from your own shell. If a section below describes a lab cluster, use it for anything that needs a
+  running cluster. If there is none and a report can only be reproduced against a live cluster, controller or
+  external service, say so in your verdict and reason from the code paths the report names and the CLI's behaviour.
 
 ## For each advisory
 
@@ -535,9 +544,9 @@ ${{ needs.collect.outputs.json }}
 2. Check the claim against the context documents. If the attacker already needs a permission that gives the same
    power (for example, they can already edit policies or the controller's configuration), or the behaviour is
    documented as the operator's choice, note the section.
-3. Reproduce it with the CLI on both releases when the report gives enough to do so. Use the report's own policies
-   and resources where it gives them, adapted only as far as needed to run. Keep notes of each command, its exit
-   code and the lines of output that matter.
+3. Reproduce it when the report gives enough to do so: with the CLI on both releases, or in the lab on the reported
+   release and the latest. Use the report's own policies and resources where it gives them, adapted only as far as
+   needed to run. Keep notes of each command, its exit code and the lines of output that matter.
 4. Compare with `published` for a possible duplicate.
 5. Score it with CVSS 3.1 from what you observed, not from the report's wording. Severity follows the score:
    9.0–10.0 critical, 7.0–8.9 high, 4.0–6.9 medium, 0.1–3.9 low, and `none` when it is not a vulnerability.

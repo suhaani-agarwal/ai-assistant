@@ -15,6 +15,11 @@ description: |
 on:
   schedule: every 6h
   workflow_dispatch:
+    inputs:
+      ghsa_id:
+        description: "Triage only this advisory, even if it has not changed since the last run. Empty for the usual pick."
+        required: false
+        type: string
 
 # copilot-requests lets the run use the built-in token for Copilot inference, billed to the organization, so no
 # personal access token is stored.
@@ -28,7 +33,8 @@ safe-outputs:
   # `gh aw compile` and commit to go live.
   staged: true
 
-timeout-minutes: 45
+# Each advisory reproduced in the lab takes about ten minutes: a fresh cluster and two installs.
+timeout-minutes: 90
 
 imports:
   - uses: kyverno/assistant/workflows/shared/security-triage.md@main
@@ -54,7 +60,13 @@ imports:
         behave as configured. Kyverno v1.20 and later reject the legacy kyverno.io policy types (ClusterPolicy,
         Policy). If the latest CLI refuses the report's policy for that reason, write the equivalent
         policies.kyverno.io policy (ValidatingPolicy, MutatingPolicy or GeneratingPolicy), run that on the latest
-        CLI, and say in the evidence which policy you ran on which release.
+        release (CLI or lab), and say in the evidence which policy you ran on which release.
+  # A throwaway kind cluster in the run, for reports that need a running cluster. Drop this import for CLI only.
+  - uses: kyverno/assistant/workflows/shared/security-triage-lab.md@main
+    with:
+      helm_repo: "https://kyverno.github.io/kyverno/"
+      chart_name: "kyverno"
+      release_namespace: "kyverno"
 ---
 
 # Security advisory triage

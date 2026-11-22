@@ -135,11 +135,13 @@ safe-outputs:
   jobs:
     post-advisory-verdict:
       description: >-
-        Record the triage verdict for one advisory. Call it once per advisory listed in the run, never for any other.
+        Record the triage verdict for one advisory listed in the run, never for any other. Call it as soon as you have
+        a result, and again when you know more: the last call for an advisory replaces the earlier ones.
       runs-on: ubuntu-latest
-      # gh-aw keeps only the first call of a safe-output job unless max says otherwise. The posting step caps at the
-      # limit again, against the advisories collect handed over.
-      max: ${{ github.aw.import-inputs.limit }}
+      # gh-aw keeps only the first call of a safe-output job unless max says otherwise. The agent records each
+      # advisory early and may update it, so allow several calls each; the posting step keeps the last valid call per
+      # advisory and caps the advisories at the limit, against the ones collect handed over.
+      max: 20
       output: "Verdict recorded."
       inputs:
         ghsa_id:
@@ -325,14 +327,20 @@ safe-outputs:
                 team = clean(os.environ.get("TEAM_MENTIONS", ""), 300).replace("@​", "@")
                 with open(os.environ["GH_AW_AGENT_OUTPUT"]) as f:
                     items = [i for i in json.load(f).get("items", []) if i.get("type") == "post_advisory_verdict"]
-                seen, posted, summary, failed = set(), 0, [], []
+                last = {}
                 for item in items:
                     item["reproduced"] = as_bool(item.get("reproduced"))
                     problem = valid(item, index)
-                    if problem or item["ghsa_id"] in seen or posted >= limit:
-                        print(f"::warning::Skipped a verdict: {problem or 'duplicate or over the limit'}")
+                    if problem:
+                        print(f"::warning::Skipped a verdict: {problem}")
                         continue
-                    seen.add(item["ghsa_id"])
+                    # The agent records a verdict early and may update it; the last valid one counts.
+                    last[item["ghsa_id"]] = item
+                posted, summary, failed = 0, [], []
+                for item in last.values():
+                    if posted >= limit:
+                        print("::warning::Skipped a verdict: over the limit")
+                        continue
                     entry = index[item["ghsa_id"]]
                     first = not entry.get("comment_id")
                     changed = entry.get("previous_classification") != item["classification"]
@@ -690,8 +698,9 @@ ${{ needs.collect.outputs.json }}
 - The project's CLI, two releases: `${{ github.aw.import-inputs.cli_binary }}-latest` and
   `${{ github.aw.import-inputs.cli_binary }}-previous`. `/tmp/gh-aw/security-triage/versions.json` says which tag
   each one is. Run `--help` on a subcommand before relying on its flags.
-- Context documents in `/tmp/gh-aw/security-triage/context/`: the project's threat model and security guidance.
-  Read them once, before the first advisory. They say what the project treats as the operator's responsibility.
+- Context documents in `/tmp/gh-aw/security-triage/context/`: the project's threat model and security guidance,
+  and any reference documents the project adds. Read the threat model once, before the first advisory: it says what
+  the project treats as the operator's responsibility. Search the reference documents with `grep` when you need them.
 - A scratch directory per advisory: `/tmp/gh-aw/security-triage/repro/<GHSA ID>/`. Write policies, resources and
   test files there with the edit tool.
 - No network from your own shell. If a section below describes a lab cluster, use it for anything that needs a
@@ -711,7 +720,10 @@ ${{ needs.collect.outputs.json }}
 4. Compare with `published` for a possible duplicate.
 5. Score it with CVSS 3.1 from what you observed, not from the report's wording. Severity follows the score:
    9.0–10.0 critical, 7.0–8.9 high, 4.0–6.9 medium, 0.1–3.9 low, and `none` when it is not a vulnerability.
-6. Call `post_advisory_verdict` for it before you start the next advisory, so a later failure cannot lose it.
+6. Record what you have with `post_advisory_verdict` as soon as you have a result on the first release you test,
+   then call it again with the full verdict once you have tested the other. The last call for an advisory replaces
+   the earlier ones, so a later failure cannot lose a result you already have. Each call stands on its own: fill
+   every field, and say in it which releases you have tested so far.
 
 ## How to write what you run
 
@@ -743,7 +755,7 @@ ${{ github.aw.import-inputs.extra_rules }}
 
 ## Output
 
-Call `post_advisory_verdict` once per advisory, with every field filled from what you actually did. Keep evidence to
+Record each advisory with `post_advisory_verdict` as described above, every field filled from what you actually did. Keep evidence to
 excerpts. Do not mention people, do not promise fixes or timelines, and do not repeat secrets, tokens or personal
 data from a report. If there is nothing to triage, call `noop`. End your run with one line per advisory: its GHSA ID,
 the classification and the suggested severity.

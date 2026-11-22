@@ -191,6 +191,13 @@ class Post(unittest.TestCase):
         calls, _ = self.run_main(items, staged=False)
         self.assertEqual(len(calls), 1)
 
+    def test_a_later_verdict_for_the_same_advisory_replaces_the_earlier_one(self):
+        early = verdict(classification="reproduced", reproduced="true", tested_versions="v1.16.1")
+        full = verdict(classification="reproduced", reproduced="true", tested_versions="v1.16.1, v1.20.0")
+        calls, _ = self.run_main([early, full, verdict(classification="invalid")], staged=False)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("v1.16.1, v1.20.0", calls[0][1]["body"])
+
     def test_a_failed_write_still_tries_the_rest_then_fails_the_job(self):
         index = {g: dict(self.index[GHSA]) for g in (GHSA, OTHER)}
         with self.assertRaises(SystemExit) as e:

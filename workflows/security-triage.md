@@ -45,12 +45,15 @@ imports:
       team_mentions: ""
       # The most advisories one run triages.
       limit: 3
-      # The CLI the agent reproduces with, and the documents that say what the project treats as the operator's
-      # responsibility. These are the defaults.
+      # The CLI the agent reproduces with (these are the defaults), and the documents it reads.
       cli_repo: "kyverno/kyverno"
       cli_asset: "kyverno-cli_{tag}_linux_x86_64.tar.gz"
       cli_binary: "kyverno"
-      context_urls: ["https://raw.githubusercontent.com/kyverno/website/main/src/content/docs/docs/guides/security.md"]
+      # The threat model, plus the CEL policy docs the agent needs to write v1.20+ policies.
+      context_urls:
+        - "https://raw.githubusercontent.com/kyverno/website/main/src/content/docs/docs/guides/security.md"
+        - "https://raw.githubusercontent.com/kyverno/website/main/src/content/docs/docs/policy-types/cel-libraries.mdx"
+        - "https://raw.githubusercontent.com/kyverno/website/main/src/content/docs/docs/guides/migration-to-cel.md"
       # Anything specific to your project that changes how reports are judged.
       extra_rules: >-
         Kyverno runs as an admission controller with cluster-wide read access and, for generate and mutate-existing
@@ -59,8 +62,10 @@ imports:
         shows a namespaced user doing it. Policies with failurePolicy Ignore, excluded namespaces or excluded groups
         behave as configured. Kyverno v1.20 and later reject the legacy kyverno.io policy types (ClusterPolicy,
         Policy). If the latest CLI refuses the report's policy for that reason, write the equivalent
-        policies.kyverno.io policy (ValidatingPolicy, MutatingPolicy or GeneratingPolicy), run that on the latest
-        release (CLI or lab), and say in the evidence which policy you ran on which release.
+        policies.kyverno.io policy (ValidatingPolicy, MutatingPolicy or GeneratingPolicy, or their Namespaced
+        variants), run that on the latest release (CLI or lab), and say in the evidence which policy you ran on which
+        release. The CEL libraries and migration documents in the context directory give the syntax: look a function
+        up there before guessing its arguments.
   # A throwaway kind cluster in the run, for reports that need a running cluster. Drop this import for CLI only.
   - uses: kyverno/assistant/workflows/shared/security-triage-lab.md@main
     with:

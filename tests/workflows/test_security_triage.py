@@ -124,7 +124,7 @@ class Post(unittest.TestCase):
         self.index = {GHSA: {"fingerprint": "0123456789abcdef", "previous_classification": None, "comment_id": None,
                              "severity": "critical", "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}}
 
-    def run_main(self, items, staged, index=None):
+    def run_main(self, items, staged, index=None, fail_on=()):
         with tempfile.TemporaryDirectory() as d:
             paths = {k: os.path.join(d, k) for k in ("agent.json", "index.json", "summary", "output")}
             pathlib.Path(paths["agent.json"]).write_text(json.dumps({"items": items}))
@@ -138,7 +138,7 @@ class Post(unittest.TestCase):
 
             def fake_run(cmd, **kw):
                 calls.append((cmd, json.loads(kw.get("input") or "{}")))
-                return subprocess.CompletedProcess(cmd, 0, "{}", "")
+                return subprocess.CompletedProcess(cmd, int(any(g in " ".join(cmd) for g in fail_on)), "{}", "")
 
             with mock.patch.dict(os.environ, env), mock.patch.object(self.s["subprocess"], "run", fake_run):
                 self.s["main"]()
@@ -191,6 +191,13 @@ class Post(unittest.TestCase):
         calls, _ = self.run_main(items, staged=False)
         self.assertEqual(len(calls), 1)
 
+    def test_a_failed_write_still_tries_the_rest_then_fails_the_job(self):
+        index = {g: dict(self.index[GHSA]) for g in (GHSA, OTHER)}
+        with self.assertRaises(SystemExit) as e:
+            self.run_main([verdict(ghsa_id=g) for g in index], staged=False, index=index, fail_on=(GHSA,))
+        self.assertIn(GHSA, str(e.exception))
+        self.assertNotIn(OTHER, str(e.exception))
+
     def test_limit_caps_the_posts(self):
         index = {g: dict(self.index[GHSA]) for g in (GHSA, OTHER, "GHSA-6jwp-h9x3-2c4m", "GHSA-9wvx-q8xj-cfgh")}
         items = [verdict(ghsa_id=g) for g in index]
@@ -238,7 +245,7 @@ class Unfinished(unittest.TestCase):
         self.index = {GHSA: {"fingerprint": "0123456789abcdef", "previous_classification": None, "comment_id": None},
                       OTHER: {"fingerprint": "fedcba9876543210", "previous_classification": None, "comment_id": None}}
 
-    def run_main(self, agent_output, staged=False, index=None, **env_over):
+    def run_main(self, agent_output, staged=False, index=None, fail_on=(), **env_over):
         with tempfile.TemporaryDirectory() as d:
             paths = {k: os.path.join(d, k) for k in ("agent.json", "index.json", "aw_info.json", "summary")}
             pathlib.Path(paths["agent.json"]).write_text(json.dumps(agent_output))
@@ -254,7 +261,7 @@ class Unfinished(unittest.TestCase):
 
             def fake_run(cmd, **kw):
                 calls.append((cmd, json.loads(kw.get("input") or "{}")))
-                return subprocess.CompletedProcess(cmd, 0, "{}", "")
+                return subprocess.CompletedProcess(cmd, int(any(g in " ".join(cmd) for g in fail_on)), "{}", "")
 
             with mock.patch.dict(os.environ, env), mock.patch.object(self.s["subprocess"], "run", fake_run):
                 self.s["main"]()
@@ -304,3 +311,9 @@ class Unfinished(unittest.TestCase):
         self.assertIn("preview, not posted", summary)
         calls, _ = self.run_main({"items": []}, AW_INFO_FILE="/nonexistent")
         self.assertEqual(calls, [])
+
+    def test_a_failed_write_still_tries_the_rest_then_fails_the_job(self):
+        with self.assertRaises(SystemExit) as e:
+            self.run_main({"items": []}, fail_on=(GHSA,))
+        self.assertIn(GHSA, str(e.exception))
+        self.assertNotIn(OTHER, str(e.exception))

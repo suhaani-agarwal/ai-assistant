@@ -325,7 +325,7 @@ safe-outputs:
                 team = clean(os.environ.get("TEAM_MENTIONS", ""), 300).replace("@​", "@")
                 with open(os.environ["GH_AW_AGENT_OUTPUT"]) as f:
                     items = [i for i in json.load(f).get("items", []) if i.get("type") == "post_advisory_verdict"]
-                seen, posted, summary = set(), 0, []
+                seen, posted, summary, failed = set(), 0, [], []
                 for item in items:
                     item["reproduced"] = as_bool(item.get("reproduced"))
                     problem = valid(item, index)
@@ -346,6 +346,7 @@ safe-outputs:
                                            input=json.dumps({"body": body}), capture_output=True, text=True)
                         if r.returncode:
                             print(f"::error::{method} comment on {item['ghsa_id']} failed")
+                            failed.append(item["ghsa_id"])
                             continue
                         summary += [f"- {item['ghsa_id']}: {item['classification']} ({'new' if first else 'updated'})"]
                     posted += 1
@@ -353,6 +354,10 @@ safe-outputs:
                     f.write("\n".join(summary or ["No verdicts."]) + "\n")
                 with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                     f.write(f"status={'skipped' if staged else 'success'}\n")
+                if failed:
+                    # Fail the job so the run shows it and record-unfinished stands down. The advisory keeps its old
+                    # fingerprint, so the next run triages it again.
+                    raise SystemExit(f"::error::Could not write the verdict on {', '.join(failed)}")
 
             if os.environ.get("SECURITY_TRIAGE_NO_MAIN") != "1":
                 main()
@@ -523,11 +528,14 @@ jobs:
         with:
           name: activation
           path: /tmp/security-triage-activation
+      # The posting job reads the agent's output from either artifact; read the same ones, or a verdict it posted
+      # from the fallback would look missing here.
       - name: Download the agent output
         continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: agent
+          pattern: "{agent,agent-output-fallback}"
+          merge-multiple: true
           path: /tmp/security-triage-agent
       - name: Split the target repository
         id: target
@@ -623,7 +631,7 @@ jobs:
                   return
               why = reason(env, agent_output)
               team = env.get("TEAM_MENTIONS", "").strip()
-              summary = []
+              summary, failed = [], []
               for g in todo:
                   entry = index[g]
                   previous = entry.get("previous_classification")
@@ -641,10 +649,13 @@ jobs:
                                      input=json.dumps({"body": body}), capture_output=True, text=True)
                   if r.returncode:
                       print(f"::error::{method} comment on {g} failed")
+                      failed.append(g)
                       continue
                   summary.append(f"- {g}: did not finish ({why})")
               with open(env["GITHUB_STEP_SUMMARY"], "a") as f:
                   f.write("\n".join(summary or ["Every advisory got a verdict."]) + "\n")
+              if failed:
+                  raise SystemExit(f"::error::Could not record {', '.join(failed)} as unfinished")
 
           if os.environ.get("SECURITY_TRIAGE_NO_MAIN") != "1":
               main()

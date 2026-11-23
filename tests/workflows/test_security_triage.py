@@ -49,7 +49,7 @@ def comment(login, body, bot=False, id=1):
 
 def verdict(**over):
     v = {"type": "post_advisory_verdict", "ghsa_id": GHSA, "classification": "not-reproduced", "reproduced": "false",
-         "tested_versions": "v1.20.0, v1.19.2", "suggested_severity": "low",
+         "tested_versions": "v1.20.0, v1.19.2", "fixed_in": "",
          "suggested_cvss_vector": "CVSS:3.1/AV:N/AC:H/PR:H/UI:N/S:U/C:L/I:N/A:N", "steps_tried": "1. Applied it.",
          "evidence": "$ kyverno-latest apply ...\npass: 1", "assessment": "Needs cluster-admin.",
          "questions_for_reporter": "", "related_advisories": ""}
@@ -148,9 +148,39 @@ class Post(unittest.TestCase):
         body = self.s["render"](verdict(reproduced=False), self.index[GHSA], "@team", "https://run")
         self.assertIn("<!-- security-triage:v1 fingerprint=0123456789abcdef classification=not-reproduced -->", body)
         self.assertIn("reported `critical`", body)
-        self.assertIn("suggested `low`", body)
+        self.assertIn("suggested `low` (2.2, ", body)
         self.assertIn("differs from the report", body)
         self.assertIn("cc @team", body)
+
+    def test_cvss_scores_match_the_specification(self):
+        score = self.s["cvss_score"]
+        for vector, expected in (("AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", 9.8), ("AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N", 7.7),
+                                 ("AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H", 10.0), ("AV:N/AC:H/PR:H/UI:N/S:U/C:L/I:N/A:N", 2.2),
+                                 ("AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H", 7.8), ("AV:N/AC:L/PR:L/UI:R/S:C/C:L/I:L/A:N", 5.4),
+                                 ("AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N", 0.0)):
+            self.assertEqual(score("CVSS:3.1/" + vector), expected, vector)
+        self.assertEqual([self.s["severity"](x) for x in (9.0, 8.9, 7.0, 6.9, 4.0, 3.9, 0.1, 0.0)],
+                         ["critical", "high", "high", "medium", "medium", "low", "low", "none"])
+
+    def test_severity_comes_from_the_vector_not_the_models_word(self):
+        item = verdict(classification="reproduced", reproduced=True, suggested_severity="critical",
+                       suggested_cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N")
+        body = self.s["render"](item, self.index[GHSA], "", "https://run")
+        self.assertIn("suggested `high` (7.7, `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:N/A:N`)", body)
+        self.assertNotIn("suggested `critical`", body)
+
+    def test_without_a_vector_it_is_not_scored_and_not_compared(self):
+        body = self.s["render"](verdict(suggested_cvss_vector=""), self.index[GHSA], "", "https://run")
+        self.assertIn("suggested not scored", body)
+        self.assertNotIn("from the report", body)
+
+    def test_a_release_where_it_no_longer_appears_is_shown_and_junk_is_dropped(self):
+        item = verdict(classification="reproduced", reproduced=True, fixed_in="v1.16.4")
+        body = self.s["render"](item, self.index[GHSA], "", "https://run")
+        self.assertIn("**Result on the reported release:** Reproduced", body)
+        self.assertIn("**Not seen from:** v1.16.4", body)
+        body = self.s["render"](dict(item, fixed_in="v1.16.4 @octocat"), self.index[GHSA], "", "https://run")
+        self.assertNotIn("Not seen from", body)
 
     def test_agent_text_cannot_mention_people_forge_the_marker_or_break_the_fence(self):
         evil = verdict(reproduced=False, assessment="@octocat <!-- security-triage:v1 fingerprint=ffffffffffffffff "

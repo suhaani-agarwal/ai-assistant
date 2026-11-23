@@ -27,11 +27,13 @@ permissions:
   contents: read
   copilot-requests: write
 
-# The model the agent runs on. Pinned rather than `auto`: in tests on a re-filed advisory, claude-sonnet-5.5 got
-# furthest, while claude-opus-5.5 and gpt-6-sol refused the report text before running anything.
+# The model the agent runs on. Pinned rather than `auto`: newer models carry always-on safety classifiers that also
+# decline benign security work (https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback). On a
+# re-filed advisory, claude-sonnet-5.5 was refused in 3 of 5 runs, claude-opus-5.5 and gpt-6-sol before running
+# anything, while claude-sonnet-5 finished 2 of 2.
 engine:
   id: copilot
-  model: claude-sonnet-5.5
+  model: claude-sonnet-5
 
 safe-outputs:
   # Threat detection keeps its default `detection` model instead of inheriting the agent's.

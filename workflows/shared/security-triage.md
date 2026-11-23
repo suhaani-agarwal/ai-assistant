@@ -150,7 +150,7 @@ safe-outputs:
           type: string
         classification:
           description: >-
-            About the reported release only, even if a newer one no longer shows it (that goes in fixed_in).
+            About result_release only, even if a newer one no longer shows it (that goes in fixed_in).
             reproduced: the reported impact reproduced. needs-non-default-config: it reproduces only with a
             configuration, permission or policy the project documents as the operator's responsibility.
             not-reproduced: you followed the report and it did not reproduce. needs-more-info: the report lacks what
@@ -161,6 +161,17 @@ safe-outputs:
         reproduced:
           description: "true only if you ran it and observed the reported impact."
           required: true
+          type: boolean
+        result_release:
+          description: >-
+            The release the classification is about, e.g. v1.16.1: the reported release, or the closest release
+            you could run if neither the CLI nor the lab could run the reported one. Empty if you ran nothing.
+          required: false
+          type: string
+          max-length: 40
+        closest_release:
+          description: "true if the reported release could not be run and result_release is the closest you could run."
+          required: false
           type: boolean
         tested_versions:
           description: "Comma-separated CLI versions you ran, e.g. v1.20.0, v1.19.2. Empty if none."
@@ -176,7 +187,7 @@ safe-outputs:
           max-length: 40
         suggested_cvss_vector:
           description: >-
-            Your CVSS 3.1 vector for what you observed on the reported release, e.g.
+            Your CVSS 3.1 vector for what you observed on result_release, e.g.
             CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N. The severity is computed from it. Empty if not a
             vulnerability.
           required: false
@@ -320,10 +331,18 @@ safe-outputs:
                     sev, suggested = None, "not scored"
                 agrees = (reported.lower() == sev) if entry.get("severity") and sev else None
                 fixed = str(item.get("fixed_in") or "").strip()
+                # The heading names the release the result is about, and never claims the reported release when the
+                # agent could only run a nearby one.
+                release = str(item.get("result_release") or "").strip()
+                release = release if VERSION.match(release) else ""
+                if as_bool(item.get("closest_release")):
+                    where = (f" on {release}" if release else "") + " (the reported release could not be run)"
+                else:
+                    where = f" on {release} (the reported release)" if release else ""
                 lines = [
                     "### Automated first-pass triage",
                     "",
-                    f"**Result on the reported release:** {CLASSIFICATIONS[cls]}  ",
+                    f"**Result{where}:** {CLASSIFICATIONS[cls]}  ",
                     f"**Reproduced:** {'yes' if item['reproduced'] else 'no'}"
                     + (f" · **Versions tried:** {clean(item.get('tested_versions'), 200)}" if item.get("tested_versions") else "")
                     + (f" · **Not seen in:** {fixed}" if VERSION.match(fixed) else "") + "  ",
@@ -764,15 +783,16 @@ ${{ needs.collect.outputs.json }}
    release and the latest. Use the report's own policies and resources where it gives them, adapted only as far as
    needed to run. Keep notes of each command, its exit code and the lines of output that matter. Work in this order:
    a. Pick the report's main claim: the one impact the rest depends on.
-   b. Reproduce that claim on the reported release. If neither the CLI nor the lab can run that exact release, say
-      so in the verdict, use the closest release you can run, and name it.
+   b. Reproduce that claim on the reported release, and put it in `result_release`. If neither the CLI nor the lab
+      can run that exact release, use the closest release you can run instead: put that one in `result_release`,
+      set `closest_release` to true, and say in the assessment why the reported one could not be run.
    c. Check the same claim on a newer release before anything else: the newest patch of the same minor release if
       you can install it (the report's policy runs there unchanged), then the latest release.
    d. Only then look at the report's further claims (for example that the same flaw also allows writes or
       privilege escalation). Build one only if it would change the severity; otherwise reason from what you have
       already shown, and say in the verdict which claims you ran and which you reasoned about.
 4. Compare with `published` for a possible duplicate.
-5. Write a CVSS 3.1 vector for what you observed on the reported release, not from the report's wording. The
+5. Write a CVSS 3.1 vector for what you observed on `result_release`, not from the report's wording. The
    severity is computed from your vector, so choose each metric with care and explain the choices in the assessment.
    Leave it empty when it is not a vulnerability.
 6. Record what you have with `post_advisory_verdict` as soon as you have a result on the first release you test,
@@ -797,13 +817,14 @@ You are checking whether a claim holds, the way a test does. Write it like a tes
 
 ## Choosing the classification
 
-The classification is about the reported release. A report that reproduces there and is gone on a newer release is
-still `reproduced`: put the first newer release where it no longer appeared in `fixed_in`.
+The classification is about `result_release`: the reported release, or the closest one when it could not be run. A
+report that reproduces there and is gone on a newer release is still `reproduced`: put the first newer release where it
+no longer appeared in `fixed_in`.
 
 - `reproduced`: you ran it and saw the reported impact.
 - `needs-non-default-config`: it reproduces, but only with a setting, permission or policy that the context documents
   make the operator's responsibility. Name the setting and the document section.
-- `not-reproduced`: you followed the report on the reported release and the impact did not appear. Say what you saw
+- `not-reproduced`: you followed the report on `result_release` and the impact did not appear. Say what you saw
   instead.
 - `needs-more-info`: the report lacks what is needed to try (no policy, no resource, no version, no steps). Ask for it.
 - `possible-duplicate`: it matches a published advisory. Name it in `related_advisories`.

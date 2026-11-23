@@ -267,8 +267,16 @@ safe-outputs:
                 return s.strip()[:cap]
 
             def cvss_or_empty(v):
-                v = str(v or "").strip()
-                return v if CVSS.match(v) else ""
+                """A valid CVSS 3.1 vector in canonical metric order, whatever order it came in; empty otherwise."""
+                parts = str(v or "").strip().split("/")
+                if not parts or parts[0] != "CVSS:3.1" or not all(p.count(":") == 1 for p in parts[1:]):
+                    return ""
+                metrics = dict(p.split(":") for p in parts[1:])
+                if len(metrics) != len(parts) - 1:
+                    return ""
+                order = ("AV", "AC", "PR", "UI", "S", "C", "I", "A")
+                canonical = "CVSS:3.1/" + "/".join(f"{k}:{metrics.get(k, '')}" for k in order)
+                return canonical if set(metrics) == set(order) and CVSS.match(canonical) else ""
 
             def cvss_score(vector):
                 """CVSS 3.1 base score, as in the specification (section 7.1 and the Roundup function in Appendix A)."""
@@ -318,7 +326,7 @@ safe-outputs:
                     f"**Result on the reported release:** {CLASSIFICATIONS[cls]}  ",
                     f"**Reproduced:** {'yes' if item['reproduced'] else 'no'}"
                     + (f" · **Versions tried:** {clean(item.get('tested_versions'), 200)}" if item.get("tested_versions") else "")
-                    + (f" · **Not seen from:** {fixed}" if VERSION.match(fixed) else "") + "  ",
+                    + (f" · **Not seen in:** {fixed}" if VERSION.match(fixed) else "") + "  ",
                     f"**Severity:** reported `{reported}`" + (f" (`{reported_vec}`)" if reported_vec else "")
                     + f" · suggested {suggested}"
                     + ("" if agrees is None else (" · agrees with the report" if agrees else " · differs from the report")),
@@ -756,7 +764,8 @@ ${{ needs.collect.outputs.json }}
    release and the latest. Use the report's own policies and resources where it gives them, adapted only as far as
    needed to run. Keep notes of each command, its exit code and the lines of output that matter. Work in this order:
    a. Pick the report's main claim: the one impact the rest depends on.
-   b. Reproduce that claim on the reported release.
+   b. Reproduce that claim on the reported release. If neither the CLI nor the lab can run that exact release, say
+      so in the verdict, use the closest release you can run, and name it.
    c. Check the same claim on a newer release before anything else: the newest patch of the same minor release if
       you can install it (the report's policy runs there unchanged), then the latest release.
    d. Only then look at the report's further claims (for example that the same flaw also allows writes or

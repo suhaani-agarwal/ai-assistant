@@ -241,6 +241,26 @@ class Lab(unittest.TestCase):
         self.assertEqual(cv("latest", entries), "3.6.3")
         self.assertIsNone(cv("v1.9.9", entries))
 
+    def test_a_minor_installs_its_newest_stable_patch(self):
+        entries = [{"version": "3.10.0", "app_version": "v1.20.0"}, {"version": "3.7.0-rc.1", "app_version": "v1.16.4-rc.1"},
+                   {"version": "3.6.3", "app_version": "v1.16.3"}, {"version": "3.6.1", "app_version": "v1.16.1"}]
+        cv = self.s["chart_version"]
+        self.assertEqual(cv("v1.16", entries), "3.6.3")
+        self.assertEqual(cv("1.20", entries), "3.10.0")
+        self.assertIsNone(cv("v1.15", entries))
+
+    def test_a_manifest_without_the_end_line_is_refused_and_not_run(self):
+        calls = []
+        with mock.patch.object(self.s["subprocess"], "run",
+                               lambda cmd, **kw: calls.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", "")), \
+             mock.patch("sys.stdout"):
+            code = self.s["kubectl"]("apply -f -", "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n  na")
+            self.assertEqual(code, 2)
+            self.assertEqual(calls, [])
+            self.assertEqual(self.s["kubectl"]("apply -f -", "apiVersion: v1\nkind: ConfigMap\n# end\n"), 0)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(self.s["kubectl"]("get pods -A"), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -720,7 +720,8 @@ ${{ needs.collect.outputs.json }}
    needed to run. Keep notes of each command, its exit code and the lines of output that matter. Work in this order:
    a. Pick the report's main claim: the one impact the rest depends on.
    b. Reproduce that claim on the reported release.
-   c. Check the same claim on the latest release, before anything else.
+   c. Check the same claim on a newer release before anything else: the newest patch of the same minor release if
+      you can install it (the report's policy runs there unchanged), then the latest release.
    d. Only then look at the report's further claims (for example that the same flaw also allows writes or
       privilege escalation). Build one only if it would change the severity; otherwise reason from what you have
       already shown, and say in the verdict which claims you ran and which you reasoned about.
@@ -742,6 +743,8 @@ You are checking whether a claim holds, the way a test does. Write it like a tes
 - Use neutral names: `probe-*` for the policies and resources you write, `canary-*` for the values you plant, and
   plain messages such as `value: {{...}}`. Do not use words like malicious, evil, attack, exploit, leak or steal in
   names, messages or your notes.
+- If something you wrote is rejected or fails to compile on a release, say that you could not express the claim
+  there and quote the error. Do not infer how the release behaves from an error message alone.
 - Describe results as observations: "the canary value from kube-system appeared in the admission response to a user
   who cannot read kube-system", not as an attack story.
 

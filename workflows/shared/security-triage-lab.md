@@ -42,6 +42,10 @@ steps:
       CLUSTER = "lab"
       MAX_OUT = 20000
       VERSION = re.compile(r"^v?\d+\.\d+\.\d+(-(alpha|beta|rc)\.\d+)?$")
+      MINOR = re.compile(r"^v?(\d+)\.(\d+)$")
+      # A manifest must end with this line. The model can be stopped part way through a tool call and the call still
+      # runs with what it had written; a cut-off manifest cannot carry the last line, so it is refused, not applied.
+      END_MARKER = "# end"
 
       # kubectl subcommands the agent may run. Everything here acts on the cluster only.
       KUBECTL_VERBS = {
@@ -99,9 +103,17 @@ steps:
 
       def chart_version(app_version, entries):
           """The chart version that ships app_version, from `helm search repo --versions -o json` entries."""
+          stable = [e for e in entries if "-" not in e.get("app_version", "")]
           if app_version == "latest":
-              stable = [e for e in entries if "-" not in e.get("app_version", "")]
               return (stable or entries)[0]["version"] if entries else None
+          m = MINOR.match(app_version)
+          if m:
+              # The newest patch of that minor release; Helm lists the newest chart first.
+              for e in stable:
+                  parts = e.get("app_version", "").lstrip("v").split(".")
+                  if parts[:2] == list(m.groups()):
+                      return e["version"]
+              return None
           want = {app_version, app_version.lstrip("v"), "v" + app_version.lstrip("v")}
           for e in entries:
               if e.get("app_version") in want:
@@ -123,8 +135,8 @@ steps:
 
       def install(version, values=""):
           version = (version or "").strip()
-          if version != "latest" and not VERSION.match(version):
-              return out(2, "version must be `latest` or a release such as v1.16.1")
+          if version != "latest" and not VERSION.match(version) and not MINOR.match(version):
+              return out(2, "version must be `latest`, a release such as v1.16.1, or a minor such as v1.16 for its newest patch")
           if len(values or "") > 20000:
               return out(2, "values are limited to 20000 characters")
           chart, ns = os.environ["LAB_CHART"], os.environ["LAB_NAMESPACE"]
@@ -145,13 +157,19 @@ steps:
               cmd += ["-f", f.name]
           code, text = run(cmd, timeout=600)
           _, pods = run(["kubectl", "get", "pods", "-n", ns, "-o", "wide"])
-          return out(code, f"chart {chart} {cv}\n{text}\n{pods}")
+          app = next((e.get("app_version") for e in entries if e.get("version") == cv), "")
+          return out(code, f"chart {chart} {cv} (release {app})\n{text}\n{pods}")
 
       def kubectl(args, stdin=""):
           try:
               tokens = check_kubectl(args)
           except ValueError as e:
               return out(2, str(e))
+          if stdin:
+              lines = [l.strip() for l in stdin.splitlines() if l.strip()]
+              if not lines or lines[-1] != END_MARKER:
+                  return out(2, f"stdin does not end with the line `{END_MARKER}`, so it was probably cut off before "
+                                "the end. Nothing was applied. Send the whole manifest again, ending with that line.")
           code, text = run(["kubectl", "--request-timeout=90s", *tokens], stdin=stdin or None, timeout=150)
           return out(code, text)
 
@@ -194,7 +212,7 @@ mcp-scripts:
       version:
         type: string
         required: true
-        description: "`latest`, or the application release to install, e.g. v1.16.1."
+        description: "`latest`, the application release to install (e.g. v1.16.1), or a minor (e.g. v1.16) for its newest patch."
       values:
         type: string
         required: false
@@ -217,7 +235,7 @@ mcp-scripts:
       stdin:
         type: string
         required: false
-        description: "Text piped to kubectl, for `-f -`."
+        description: "Text piped to kubectl, for `-f -`. Its last line must be `# end`."
     run: python3 -I "$RUNNER_TEMP/security-triage-lab/lab.py" kubectl
     timeout: 180
 ---
@@ -231,10 +249,13 @@ controller crashing. Use the CLI for what the CLI can show on its own.
 
 - `lab-reset` gives you a fresh empty cluster. It already ran once before you started, so the cluster exists, but
   nothing is installed in it yet.
-- `lab-install` installs a release with Helm: `latest`, or the version the report names. Pass Helm values when the
-  report needs a non-default setting, and say in your verdict which ones you set and why.
-- `lab-kubectl` runs one kubectl command. Put manifests in `stdin` with `-f -`. Act as a restricted user with
-  `--as=system:serviceaccount:<namespace>:<name>` after creating that service account and its Role and RoleBinding.
+- `lab-install` installs a release with Helm: a version such as `v1.16.1`, a minor such as `v1.16` for its newest
+  patch, or `latest`. Its output names the release it installed. Pass Helm values when the report needs a non-default
+  setting, and say in your verdict which ones you set and why.
+- `lab-kubectl` runs one kubectl command. Put manifests in `stdin` with `-f -`, and end `stdin` with the line `# end`:
+  if that line is missing, the input was cut off and nothing is applied, so send it again in full. Act as a
+  restricted user with `--as=system:serviceaccount:<namespace>:<name>` after creating that service account and its
+  Role and RoleBinding.
 
 How to use it:
 
@@ -245,10 +266,13 @@ How to use it:
 2. Install the version the report names, follow the report's steps for its main claim as that account, and record
    what you observe: denials, the canary showing up where it should not, a resource changed, a controller
    restarting (`get pods -n <namespace>` restart counts and `logs --previous`). Record the verdict so far.
-3. Then `lab-reset`, install `latest`, and repeat the same claim, so you can say whether it still happens. Do this
-   before trying any further claim from the report. If the report names a fixed release, trying that one too is the
-   strongest check.
-4. `lab-reset` before moving to the next advisory.
+3. Then `lab-reset`, install the newest patch of the same minor release (for a report on v1.16.1, install `v1.16`),
+   and repeat the same claim with the same policy. Fixes usually ship as patches, so this shows whether the claim is
+   fixed, and the report's policy runs there unchanged.
+4. Then `lab-reset`, install `latest`, and repeat the same claim, so you can say whether it still happens today. If
+   the latest release no longer accepts the report's policy, follow this project's rules for the replacement.
+5. Do steps 3 and 4 before trying any further claim from the report. `lab-reset` before moving to the next
+   advisory.
 
 If a report needs something the lab cannot provide (a cloud provider, several nodes, an unreleased build, the
 public internet), say exactly what was missing in your verdict and call `report_missing_tool` naming it, then

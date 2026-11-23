@@ -101,6 +101,18 @@ steps:
                   raise ValueError("pass manifests through the stdin input with -f -, not as a file path")
           return tokens
 
+      def reads_manifest(tokens):
+          """Whether kubectl reads a manifest from stdin (`-f -`), as opposed to stdin for a container (exec, run)."""
+          flags = tokens[:tokens.index("--")] if "--" in tokens else tokens
+          if flags and flags[0] == "logs":
+              return False
+          for i, t in enumerate(flags):
+              if t in ("-f-", "-f=-", "--filename=-"):
+                  return True
+              if t in ("-f", "--filename") and i + 1 < len(flags) and flags[i + 1] == "-":
+                  return True
+          return False
+
       def chart_version(app_version, entries):
           """The chart version that ships app_version, from `helm search repo --versions -o json` entries."""
           stable = [e for e in entries if "-" not in e.get("app_version", "")]
@@ -165,8 +177,9 @@ steps:
               tokens = check_kubectl(args)
           except ValueError as e:
               return out(2, str(e))
-          if stdin:
-              lines = [l.strip() for l in stdin.splitlines() if l.strip()]
+          if stdin and reads_manifest(tokens):
+              # Only trailing whitespace is ignored: an indented `# end` can be the last line of a cut-off block.
+              lines = [l.rstrip() for l in stdin.splitlines() if l.strip()]
               if not lines or lines[-1] != END_MARKER:
                   return out(2, f"stdin does not end with the line `{END_MARKER}`, so it was probably cut off before "
                                 "the end. Nothing was applied. Send the whole manifest again, ending with that line.")
@@ -235,7 +248,7 @@ mcp-scripts:
       stdin:
         type: string
         required: false
-        description: "Text piped to kubectl, for `-f -`. Its last line must be `# end`."
+        description: "Text piped to kubectl. For a manifest (`-f -`), its last line must be `# end`, unindented."
     run: python3 -I "$RUNNER_TEMP/security-triage-lab/lab.py" kubectl
     timeout: 180
 ---

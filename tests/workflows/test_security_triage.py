@@ -260,6 +260,18 @@ class Lab(unittest.TestCase):
             self.assertEqual(self.s["kubectl"]("apply -f -", "apiVersion: v1\nkind: ConfigMap\n# end\n"), 0)
             self.assertEqual(len(calls), 1)
             self.assertEqual(self.s["kubectl"]("get pods -A"), 0)
+            # An indented `# end` is the last line of a cut-off block, not the marker.
+            self.assertEqual(self.s["kubectl"]("apply --filename=-", "data:\n  x: |\n    # end\n"), 2)
+            self.assertEqual(len(calls), 2)
+
+    def test_stdin_for_a_container_needs_no_end_line_and_is_passed_unchanged(self):
+        inputs = []
+        with mock.patch.object(self.s["subprocess"], "run",
+                               lambda cmd, **kw: inputs.append(kw.get("input")) or subprocess.CompletedProcess(cmd, 0, "", "")), \
+             mock.patch("sys.stdout"):
+            self.assertEqual(self.s["kubectl"]("exec -i -n t probe -- cat", "hello\n"), 0)
+            self.assertEqual(self.s["kubectl"]("exec -i -n t probe -- sh -c 'kubectl apply -f -'", "x: 1\n"), 0)
+        self.assertEqual(inputs, ["hello\n", "x: 1\n"])
 
 
 if __name__ == "__main__":

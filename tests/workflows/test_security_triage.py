@@ -197,6 +197,10 @@ class Post(unittest.TestCase):
                       render(result_release="v1.16.4", closest_release="true"))
         self.assertIn("**Result (the reported release could not be run):**",
                       render(result_release="", closest_release=True))
+        self.assertIn("**Result on v1.17.0-rc.1 (the reported release):**",
+                      render(result_release="v1.17.0-rc.1", fixed_in="v1.17.0-rc.2"))
+        self.assertIn("**Not seen in:** v1.17.0-rc.2", render(result_release="v1.17.0-rc.1", fixed_in="v1.17.0-rc.2"))
+        self.assertIn("**Result:** ", render(result_release="v1.17.0-rc.1;x", closest_release="false"))
         body = render(result_release="v1.16.1 @octocat", closest_release="false")
         self.assertIn("**Result:** ", body)
         self.assertNotIn("reported release", body)

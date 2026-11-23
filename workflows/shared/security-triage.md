@@ -266,7 +266,8 @@ safe-outputs:
                 "possible-duplicate": "Possibly covered by a published advisory",
             }
             CVSS = re.compile(r"^CVSS:3\.1/AV:[NALP]/AC:[LH]/PR:[NLH]/UI:[NR]/S:[UC]/C:[NLH]/I:[NLH]/A:[NLH]$")
-            VERSION = re.compile(r"^v?\d+\.\d+(\.\d+)?$")
+            # The same releases the lab installs, release candidates included.
+            VERSION = re.compile(r"^v?\d+\.\d+(\.\d+(-(alpha|beta|rc)\.\d+)?)?$")
             GHSA = re.compile(r"^GHSA(-[23456789cfghjmpqrvwx]{4}){3}$")
 
             def clean(value, cap):

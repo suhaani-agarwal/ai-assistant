@@ -132,6 +132,13 @@ class Collect(unittest.TestCase):
         self.assertEqual(self.rel("1.19.0"), "v1.19.0")
         self.assertEqual(self.rel("<= 1.18.1", "<= 1.16.2"), "v1.18.1")
 
+    def test_only_the_projects_own_package_ranges_count(self):
+        vulns = [{"package": {"ecosystem": "go", "name": "github.com/kyverno/kyverno"}, "vulnerable_version_range": "<= 1.18.1"},
+                 {"package": {"ecosystem": "go", "name": "github.com/kyverno/policy-reporter"}, "vulnerable_version_range": "< 2.0.0"}]
+        self.assertEqual(self.s["reported_release"](vulns, self.RELEASES, "github.com/kyverno/kyverno"), "v1.18.1")
+        self.assertEqual(self.s["reported_release"]([{"vulnerable_version_range": "<= 1.16.2"}], self.RELEASES,
+                                                    "github.com/kyverno/kyverno"), "v1.16.2")  # no package named
+
     def test_an_unreadable_range_gives_no_reported_release(self):
         for bad in ("All", "main @ 21168fdf", "NONE", "v1.9.0 - v1.12.7", "", "<= 1.5.0"):
             self.assertIsNone(self.rel(bad), bad)
@@ -150,6 +157,17 @@ class Collect(unittest.TestCase):
                                          "vulnerable_version_range": "<= 1.18.1"}])
         todo, _ = self.s["pick"]([adv], self.comments({}), 3, "", self.RELEASES)
         self.assertEqual(todo[0]["reported_release"], "v1.18.1")
+
+    def test_an_unfinished_advisory_waits_behind_new_ones_and_still_gets_a_free_slot(self):
+        stuck = advisory(OTHER, created_at="2026-10-01T00:00:00Z")
+        marker = comment("triage[bot]", "<!-- security-triage:v1 fingerprint=0000000000000000 classification=unfinished -->",
+                         bot=True, id=7)
+        comments = self.comments({OTHER: [marker]})
+        todo, index = self.s["pick"]([stuck, advisory()], comments, 1)
+        self.assertEqual([t["ghsa_id"] for t in todo], [GHSA])  # the newer, untriaged report goes first
+        self.assertEqual(list(index), [GHSA])
+        todo, _ = self.s["pick"]([stuck], comments, 1)
+        self.assertEqual([t["ghsa_id"] for t in todo], [OTHER])  # retried when nothing else waits
 
     def test_long_descriptions_are_cut(self):
         todo, _ = self.s["pick"]([advisory(description="a" * 50000)], self.comments({}), 3)

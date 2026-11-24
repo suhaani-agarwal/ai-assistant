@@ -578,13 +578,18 @@ jobs:
           RELEASE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
           CONSTRAINT = re.compile(r"^(<=|>=|<|>|==|=)?\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?$")
 
-          def reported_release(vulnerabilities, releases):
+          def reported_release(vulnerabilities, releases, package=""):
               """The release to test first: the newest published release inside the advisory's version ranges, e.g.
-              `<= 1.18.1` gives v1.18.1 and `< 1.19.1` the newest release below it. None if no range can be read."""
+              `<= 1.18.1` gives v1.18.1 and `< 1.19.1` the newest release below it. Only the ranges for `package`
+              count (an advisory can list other affected products), and an entry with no package. None if no range
+              can be read."""
               def ver(m):
                   return tuple(int(g or 0) for g in m.groups()[-3:])
               found = []
               for vuln in vulnerabilities or []:
+                  name = str(((vuln or {}).get("package") or {}).get("name") or "").lower()
+                  if package and name and name != package.lower():
+                      continue
                   text = str((vuln or {}).get("vulnerable_version_range") or "").replace("\\", "").replace("`", "")
                   parts = [p.strip() for p in text.split(",") if p.strip()]
                   constraints = []
@@ -774,12 +779,12 @@ jobs:
                       return c, m.group(1), m.group(2)
               return None, None, None
 
-          def pick(advisories, comments_for, limit, only="", releases=()):
-              """Advisories to triage and the index for the posting job. `only` triages that one even if unchanged."""
-              todo, index = [], {}
+          def pick(advisories, comments_for, limit, only="", releases=(), package=""):
+              """Advisories to triage and the index for the posting job. `only` triages that one even if unchanged.
+              New and changed reports go first, oldest first; an advisory left unfinished by an earlier run is retried
+              only when a slot is free, so one that keeps failing cannot hold the queue."""
+              candidates = []
               for adv in sorted(advisories, key=lambda a: a.get("created_at") or ""):
-                  if len(todo) >= limit:
-                      break
                   g = adv["ghsa_id"]
                   if only and g != only:
                       continue
@@ -793,22 +798,25 @@ jobs:
                   if old_fp == fp and not only:
                       continue
                   humans = [c for c in comments if (c.get("user") or {}).get("type") != "Bot"][-MAX_COMMENTS:]
-                  todo.append({
+                  entry = {
                       "ghsa_id": g, "state": adv.get("state"), "summary": adv.get("summary"),
                       "description": (adv.get("description") or "")[:MAX_DESCRIPTION],
                       "reporter": reporter, "reported_severity": adv.get("severity"),
                       "reported_cvss_vector": cvss_vector(adv), "cwe_ids": adv.get("cwe_ids"),
                       "vulnerabilities": adv.get("vulnerabilities"), "created_at": adv.get("created_at"),
-                      "reported_release": reported_release(adv.get("vulnerabilities"), releases),
+                      "reported_release": reported_release(adv.get("vulnerabilities"), releases, package),
                       "previous_bot_result": old_cls,
                       "comments": [{"author": (c.get("user") or {}).get("login"),
                                     "is_reporter": (c.get("user") or {}).get("login") == reporter,
                                     "body": (c.get("body") or "")[:MAX_COMMENT]} for c in humans],
-                  })
-                  index[g] = {"fingerprint": fp, "previous_classification": old_cls,
-                              "comment_id": mine["id"] if mine else None,
-                              "severity": adv.get("severity"), "cvss_vector": cvss_vector(adv)}
-              return todo, index
+                  }
+                  row = {"fingerprint": fp, "previous_classification": old_cls,
+                         "comment_id": mine["id"] if mine else None,
+                         "severity": adv.get("severity"), "cvss_vector": cvss_vector(adv)}
+                  candidates.append((old_cls == "unfinished", entry, row))
+              # Stable sort: retries after the rest, each group still oldest first.
+              chosen = sorted(candidates, key=lambda c: c[0])[:limit]
+              return [e for _, e, _ in chosen], {e["ghsa_id"]: r for _, e, r in chosen}
 
           def main():
               target, limit = os.environ["TARGET_REPO"], int(os.environ["LIMIT"])
@@ -823,7 +831,8 @@ jobs:
                   if g not in cache:
                       cache[g] = gh_list(f"repos/{target}/security-advisories/{g}/comments?per_page=100")
                   return cache[g]
-              todo, index = pick(advisories, comments_for, limit, only, releases_of(os.environ["CLI_REPO"]))
+              repo = os.environ["CLI_REPO"]
+              todo, index = pick(advisories, comments_for, limit, only, releases_of(repo), f"github.com/{repo}")
               write_manifests(todo, advisories, comments_for)
               # Counts only: the log of a public repository must not carry report text or which reports exist.
               print(f"{sum(len(t['manifests']) for t in todo)} manifest files from the reports to triage")

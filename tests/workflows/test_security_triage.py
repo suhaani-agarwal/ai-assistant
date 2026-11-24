@@ -148,6 +148,19 @@ class Collect(unittest.TestCase):
         self.assertIn("[docs](https://kyverno.io/docs)", found[0]["text"])
         self.assertIn("repaired", found[0])
 
+    def test_a_shift_operator_in_yaml_is_not_taken_for_a_heredoc(self):
+        policy = ("apiVersion: policies.kyverno.io/v1\nkind: ValidatingPolicy\nmetadata:\n  name: probe\nspec:\n"
+                  "  validations:\n  - expression: (1 << n) > 0\n  - expression: 'true'\n")
+        found, _ = self.s["manifests_from"]([("description", "```yaml\n" + policy + "```")])
+        self.assertEqual([m["file"] for m in found], ["01-ValidatingPolicy-probe.yaml"])
+        self.assertEqual(found[0]["text"], policy)
+
+    def test_size_limits_count_bytes_so_every_listed_file_passes_the_lab_check(self):
+        wide = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: w\ndata:\n  x: " + "\U0001F600" * 16000
+        found, notes = self.s["manifests_from"]([("description", "```yaml\n" + wide + "\n```")])
+        self.assertEqual(found, [])
+        self.assertEqual(notes, ["description, code block 1: left out, over the size or count limit"])
+
     def test_a_longer_fence_holds_a_shorter_one_and_an_unclosed_block_runs_to_the_end(self):
         blocks = self.s["fenced_blocks"]("````md\n```yaml\nx: 1\n```\n````\n  ```yml\n  a: 1\n  b: 2")
         self.assertEqual(blocks, [("md", "```yaml\nx: 1\n```"), ("yml", "a: 1\nb: 2")])

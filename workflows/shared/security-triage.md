@@ -492,7 +492,7 @@ jobs:
           MAX_DESCRIPTION, MAX_COMMENT, MAX_COMMENTS = 12000, 3000, 10
           # The Kubernetes manifests in a report are copied into files, exactly as written, so the agent applies them
           # by path instead of retyping them. The text is untrusted: the files are only written, never run, their
-          # names come from this script, and their number and size are capped.
+          # names come from this script, and their number and size (in bytes, as lab-kubectl checks it) are capped.
           MANIFESTS_DIR = "/tmp/security-triage-manifests"
           MAX_MANIFESTS, MAX_DOC, MAX_TOTAL, MAX_NOTES = 40, 64000, 256000, 10
           FENCE = re.compile(r"^(\s*)(`{3,}|~{3,})(.*)$")
@@ -564,10 +564,13 @@ jobs:
               for label, text in sources:
                   for b, (lang, block) in enumerate(fenced_blocks(text), 1):
                       where = f"{label}, code block {b}"
-                      for doc in [d for part in (heredocs(block) or [block]) for d in documents(part)]:
+                      # Here-document bodies first, then the block itself: `<<` also appears in YAML (a CEL `1 << n`),
+                      # so a block is never dropped for looking like shell. Repeats are skipped below.
+                      for doc in [d for part in heredocs(block) + [block] for d in documents(part)]:
                           fixed = unlink(doc)
                           repaired, doc = fixed != doc, fixed
-                          if len(found) >= MAX_MANIFESTS or len(doc) > MAX_DOC or total + len(doc) > MAX_TOTAL:
+                          size = len((doc.strip("\n") + "\n").encode())
+                          if len(found) >= MAX_MANIFESTS or size > MAX_DOC or total + size > MAX_TOTAL:
                               notes.append(f"{where}: left out, over the size or count limit")
                               continue
                           try:
@@ -584,7 +587,7 @@ jobs:
                           if doc.strip() in seen:
                               continue
                           seen.add(doc.strip())
-                          total += len(doc)
+                          total += size
                           meta = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
                           name = meta.get("name") or meta.get("generateName") or ""
                           found.append({

@@ -696,6 +696,8 @@ jobs:
                   return cache[g]
               todo, index = pick(advisories, comments_for, limit, only)
               write_manifests(todo, advisories, comments_for)
+              # Counts only: the log of a public repository must not carry report text or which reports exist.
+              print(f"{sum(len(t['manifests']) for t in todo)} manifest files from the reports to triage")
               published = [{"ghsa_id": a["ghsa_id"], "cve_id": a.get("cve_id"), "summary": a.get("summary"),
                             "severity": a.get("severity"), "cwe_ids": a.get("cwe_ids")}
                            for a in (gh_list(f"repos/{target}/security-advisories?state=published&per_page=100") or [])][:60]

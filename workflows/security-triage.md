@@ -49,9 +49,11 @@ safe-outputs:
 # Each advisory reproduced in the lab takes about ten minutes: a fresh cluster and two installs.
 timeout-minutes: 90
 
-# The most AI credits one run may spend: about 200 per advisory, which a normal triage stays well under. A run that
-# reaches it stops; the verdict recorded so far still posts, and an advisory with none is marked unfinished.
-max-ai-credits: ${{ inputs.ghsa_id && '200' || '600' }}
+# The most AI credits one run may spend. With one advisory per run (limit below) this is a cap per advisory; a
+# normal triage stays well under it. A run that reaches it stops: the verdict recorded so far still posts, and an
+# advisory with none is marked unfinished and tried again next run. Raise it together with limit. A plain number:
+# gh-aw ignores an expression here.
+max-ai-credits: 200
 
 imports:
   - uses: kyverno/assistant/workflows/shared/security-triage.md@main
@@ -60,8 +62,9 @@ imports:
       target_repo: "kyverno/kyverno"
       # Mentioned on the first verdict for an advisory and when the result changes. Empty for none.
       team_mentions: ""
-      # The most advisories one run triages.
-      limit: 3
+      # The most advisories one run triages. One per run keeps max-ai-credits a cap per advisory; at every 6 hours that
+      # is up to four a day.
+      limit: 1
       # The CLI the agent reproduces with (these are the defaults), and the documents it reads.
       cli_repo: "kyverno/kyverno"
       cli_asset: "kyverno-cli_{tag}_linux_x86_64.tar.gz"

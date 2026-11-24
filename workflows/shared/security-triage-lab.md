@@ -52,6 +52,8 @@ steps:
       RULE_VERBS = {"get", "list", "watch", "create", "update", "patch", "delete", "deletecollection", "*"}
       RESOURCE = re.compile(r"^([a-z0-9*][a-z0-9-]*)(/[a-z]+)?(\.[a-z0-9][a-z0-9.-]*)?$")
       DATA_KEY = re.compile(r"^[-._a-zA-Z0-9]{1,253}$")
+      # ConfigMap and Secret names are DNS subdomains: labels joined by dots, up to 253 characters.
+      SUBDOMAIN = re.compile(r"^(?=.{1,253}$)[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$")
       CLUSTER = "lab"
       MAX_OUT = 20000
       VERSION = re.compile(r"^v?\d+\.\d+\.\d+(-(alpha|beta|rc)\.\d+)?$")
@@ -282,9 +284,11 @@ steps:
           ns, other, user = namespace or "probe-tenant", other_namespace or "probe-other", user or "probe-user"
           name, key = canary_name or "probe-canary", canary_key or "value"
           try:
-              for n in (ns, other, user, name):
+              for n in (ns, other, user):
                   if not NAME.match(n):
                       raise ValueError(f"{n!r} is not a valid Kubernetes name")
+              if not SUBDOMAIN.match(name):
+                  raise ValueError(f"{name!r} is not a valid ConfigMap or Secret name")
               if not DATA_KEY.match(key):
                   raise ValueError(f"{key!r} is not a valid data key")
               if len(user) > 55:
@@ -295,6 +299,10 @@ steps:
           except ValueError as e:
               return out(2, str(e))
           canary = "canary-" + secrets.token_hex(4)
+          # An object that already exists (kube-system/coredns, say) is left as it is: writing the canary into it could
+          # break the lab. Its own value then plays the canary's part.
+          existing = [kind for kind in ("configmap", "secret")
+                      if run(["kubectl", "get", kind, name, "-n", other, "-o", "name"], timeout=60)[0] == 0]
           objects = [
               {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns}},
               {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": other}},
@@ -305,11 +313,13 @@ steps:
                "metadata": {"name": f"{user}-binding", "namespace": ns},
                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": f"{user}-role"},
                "subjects": [{"kind": "ServiceAccount", "name": user, "namespace": ns}]},
-              {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": name, "namespace": other},
-               "data": {key: canary}},
-              {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name, "namespace": other},
-               "stringData": {key: canary}},
           ]
+          if "configmap" not in existing:
+              objects.append({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": name, "namespace": other},
+                              "data": {key: canary}})
+          if "secret" not in existing:
+              objects.append({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name, "namespace": other},
+                              "stringData": {key: canary}})
           code, applied = run(["kubectl", "--request-timeout=90s", "apply", "-f", "-"],
                               stdin=json.dumps({"apiVersion": "v1", "kind": "List", "items": objects}), timeout=150)
           log(f"lab-tenant namespace={ns} other_namespace={other} user={user} canary={other}/{name}:{key} "
@@ -329,9 +339,15 @@ steps:
               if first not in ("yes", "no"):
                   return out(code or 1, f"the user was created, but `auth can-i {verb} {resource}` failed:\n{answer}")
               lines.append(f"  {first:4} {verb} {resource} " + (f"-n {where}" if where else "--all-namespaces"))
-          return out(0, f"act as this user with: --as={as_user}\n"
-                        f"canary value: {canary}, under key `{key}` in ConfigMap {other}/{name} and Secret {other}/{name}\n"
-                        "what the user can do (kubectl auth can-i):\n" + "\n".join(lines) + "\n\n" + applied)
+          label = {"configmap": "ConfigMap", "secret": "Secret"}
+          planted = " and ".join(f"{label[k]} {other}/{name}" for k in label if k not in existing)
+          kept = " and ".join(f"{label[k]} {other}/{name}" for k in existing)
+          head = f"act as this user with: --as={as_user}\n"
+          if planted:
+              head += f"canary value: {canary}, under key `{key}` in {planted}\n"
+          if kept:
+              head += f"already existed and left unchanged, so its own value is the canary: {kept}\n"
+          return out(0, head + "what the user can do (kubectl auth can-i):\n" + "\n".join(lines) + "\n\n" + applied)
 
       def kubectl(args, stdin="", file=""):
           try:

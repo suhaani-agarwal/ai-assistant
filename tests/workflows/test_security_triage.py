@@ -146,11 +146,33 @@ class Collect(unittest.TestCase):
 
     def test_an_unreadable_release_list_stops_the_run_instead_of_guessing(self):
         failed = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "rate limit")
+        def offline(*a, **k):
+            raise OSError("no network")
         with mock.patch.object(self.s["subprocess"], "run", failed), \
-             mock.patch.dict(os.environ, {"RELEASES_TOKEN": "t"}):
+             mock.patch.object(self.s["urllib"].request, "urlopen", offline), \
+             mock.patch.dict(os.environ, {"RELEASES_TOKEN": "t"}), mock.patch("sys.stdout"):
             with self.assertRaises(SystemExit) as e:
                 self.s["releases_of"]("kyverno/kyverno")
         self.assertIn("nothing is triaged", str(e.exception))
+
+    def test_the_release_list_is_read_without_a_token_when_the_runs_token_is_refused(self):
+        class Resp:
+            def __init__(self, body, link=""):
+                self.body, self.headers = body, {"Link": link}
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, *a): return self.body
+        pages = [Resp(b'[{"tag_name": "v1.20.0"}, {"tag_name": "v1.20.0-rc.1", "prerelease": true}]',
+                      '<https://api.github.com/x?page=2>; rel="next"'),
+                 Resp(b'[{"tag_name": "v1.19.2"}]')]
+        refused = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "403")
+        with mock.patch.object(self.s["subprocess"], "run", refused), \
+             mock.patch.object(self.s["urllib"].request, "urlopen", lambda *a, **k: pages.pop(0)), \
+             mock.patch.dict(os.environ, {"RELEASES_TOKEN": "t"}), mock.patch("sys.stdout"):
+            self.assertEqual(self.s["releases_of"]("kyverno/kyverno"), ["v1.20.0", "v1.19.2"])
+
+    def test_every_published_advisory_is_kept_for_duplicate_checks(self):
+        self.assertIn('state=published&per_page=100") or [])]\n', SHARED.read_text())
 
     def test_the_picked_advisory_carries_its_reported_release(self):
         adv = advisory(vulnerabilities=[{"package": {"ecosystem": "go", "name": "github.com/kyverno/kyverno"},
@@ -170,7 +192,7 @@ class Collect(unittest.TestCase):
         self.assertEqual([t["ghsa_id"] for t in todo], [OTHER])  # retried when nothing else waits
 
     def test_long_descriptions_are_cut(self):
-        todo, _ = self.s["pick"]([advisory(description="a" * 50000)], self.comments({}), 3)
+        todo, _ = self.s["pick"]([advisory(description="a" * 100000)], self.comments({}), 3)
         self.assertEqual(len(todo[0]["description"]), self.s["MAX_DESCRIPTION"])
 
 
@@ -385,6 +407,12 @@ class Post(unittest.TestCase):
         calls, _ = self.run_main(items, staged=False, index=index)
         self.assertEqual(len(calls), 3)
 
+
+    def test_a_report_the_bot_cannot_run_is_shown_as_not_tested(self):
+        body = self.s["render"](verdict(classification="not-tested", suggested_cvss_vector=""), self.index[GHSA], "",
+                                "https://run")
+        self.assertIn("Could not be tested here", body)
+        self.assertIn("classification=not-tested -->", body)
 
     def test_the_lab_commands_recorded_for_the_advisory_are_listed_and_cannot_inject(self):
         cmds = [{"ghsa": GHSA, "release": "v1.16.1", "cmd": "kubectl apply -f - < 01-Policy-x.yaml", "exit": 0},
@@ -665,6 +693,15 @@ class Unfinished(unittest.TestCase):
         self.assertIn("cc @kyverno/security", body)
         self.assertIn("fingerprint=0000000000000000 classification=unfinished -->", body)
 
+    def test_a_failed_agent_says_how_many_credits_it_spent(self):
+        with tempfile.TemporaryDirectory() as d:
+            usage = os.path.join(d, "agent_usage.json")
+            pathlib.Path(usage).write_text(json.dumps({"ai_credits": 200.4}))
+            calls, _ = self.run_main({"items": []}, AGENT_RESULT="failure", AGENT_USAGE_FILE=usage)
+        self.assertIn("The agent job failed after spending 200 AI credits.", calls[0][1]["body"])
+        calls, _ = self.run_main({"items": []}, AGENT_RESULT="failure", AGENT_USAGE_FILE="/nonexistent")
+        self.assertIn("The agent job failed. No verdict", calls[0][1]["body"])
+
     def test_its_marker_is_read_by_collect_and_never_matches_a_fingerprint(self):
         collect = script("def pick(")
         body = self.s["render"]("x", "", "https://run")
@@ -806,6 +843,19 @@ class Prompt(unittest.TestCase):
         self.assertIn("${{ github.aw.import-inputs.cli_binary }}-reported:*", self.shared_front["tools"]["bash"])
         self.assertIn("-reported` for the advisory's `reported_release`", self.shared)
         self.assertIn('install(tag, "reported")', SHARED.read_text())
+
+    def test_not_tested_is_a_choice_and_explained_once(self):
+        options = self.shared_front["safe-outputs"]["jobs"]["post-advisory-verdict"]["inputs"]["classification"]["options"]
+        self.assertIn("not-tested", options)
+        self.assertEqual(self.shared.count("- `not-tested`:"), 1)
+        # Calling report_missing_tool is said once, in the not-tested rule, not again by the lab.
+        self.assertEqual((self.shared + self.lab).count("report_missing_tool"), 1)
+        self.assertNotIn("the\npublic internet", self.lab)
+        self.assertIn('"possible-duplicate", "not-tested"}', SHARED.read_text())  # record-unfinished knows it
+
+    def test_the_lab_says_how_to_handle_background_effects_outgoing_requests_and_old_releases(self):
+        for phrase in ("get updaterequests -A", "run a small\n     listener pod", "Kubernetes version from that release's time"):
+            self.assertEqual(self.lab.count(phrase), 1, phrase)
 
     def test_the_verdict_may_be_recorded_early_and_again(self):
         self.assertNotIn("one `post_advisory_verdict` call", self.shared)

@@ -539,10 +539,17 @@ For each release the advisory steps ask you to test:
 2. Follow the report's steps as that user and record what you observe: denials, the canary showing up where it
    should not, a resource changed, a controller restarting (`get pods -n <namespace>` restart counts and
    `logs --previous`).
+   - Generate, mutate-existing and cleanup rules act in the background, seconds after the request. Before deciding
+     that nothing happened, wait with `wait` or check again for up to a minute, and look at `get updaterequests -A`,
+     events and the background or cleanup controller's logs.
+   - For a report that sends a request out (an `apiCall` or service call to a URL, a token sent along), run a small
+     listener pod in the lab, for example a plain HTTP server image, point the report's policy at its Service, and
+     use the listener's logs as the evidence. Lab pods can pull images from the internet.
+   - If a release does not become ready, it may not support the lab's Kubernetes version: `lab-reset` with a
+     Kubernetes version from that release's time, install it again, and say so in the verdict.
 3. `lab-reset` before the next release and before the next advisory.
 
 The lab records every command it runs, and the verdict comment lists them next to your evidence.
 
-If a report needs something the lab cannot provide (a cloud provider, several nodes, an unreleased build, the
-public internet), say exactly what was missing in your verdict and call `report_missing_tool` naming it, then
-reason from what you could test.
+If a report needs something the lab cannot provide (a cloud provider, several nodes, an unreleased build, signing
+keys and a registry), and the CLI cannot show it either, it is `not-tested`.

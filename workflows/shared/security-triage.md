@@ -198,10 +198,12 @@ safe-outputs:
             reproduced: the reported impact reproduced. needs-non-default-config: it reproduces only with a
             configuration, permission or policy the project documents as the operator's responsibility.
             not-reproduced: you followed the report and it did not reproduce. needs-more-info: the report lacks what
-            is needed to try. possible-duplicate: it matches a published advisory.
+            is needed to try. possible-duplicate: it matches a published advisory. not-tested: the report is about
+            something the CLI and the lab cannot run.
           required: true
           type: choice
-          options: ["reproduced", "needs-non-default-config", "not-reproduced", "needs-more-info", "possible-duplicate"]
+          options: ["reproduced", "needs-non-default-config", "not-reproduced", "needs-more-info", "possible-duplicate",
+                    "not-tested"]
         reproduced:
           description: "true only if you ran it and observed the reported impact."
           required: true
@@ -316,6 +318,7 @@ safe-outputs:
                 "not-reproduced": "Did not reproduce",
                 "needs-more-info": "More information needed to reproduce",
                 "possible-duplicate": "Possibly covered by a published advisory",
+                "not-tested": "Could not be tested here",
             }
             CVSS = re.compile(r"^CVSS:3\.1/AV:[NALP]/AC:[LH]/PR:[NLH]/UI:[NR]/S:[UC]/C:[NLH]/I:[NLH]/A:[NLH]$")
             # The same releases the lab installs, release candidates included.
@@ -567,11 +570,12 @@ jobs:
           RELEASES_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY'
-          import hashlib, json, os, re, subprocess
+          import hashlib, json, os, re, subprocess, urllib.request
           import yaml
 
           MARKER = re.compile(r"<!-- security-triage:v1 fingerprint=([0-9a-f]{16}) classification=([a-z-]+) -->")
-          MAX_DESCRIPTION, MAX_COMMENT, MAX_COMMENTS = 12000, 3000, 10
+          # Generous: the agent reads these from a file, and long reports keep their steps near the end.
+          MAX_DESCRIPTION, MAX_COMMENT, MAX_COMMENTS = 60000, 10000, 10
           # The agent's input is a file, not a job output: GitHub drops a job output that happens to contain the text
           # of any masked secret, and report text can contain anything.
           ADVISORIES_DIR = "/tmp/security-triage-advisories"
@@ -615,11 +619,29 @@ jobs:
               to triage nothing and let the next run try again."""
               r = subprocess.run(["gh", "api", "--paginate", "--slurp", f"repos/{repo}/releases?per_page=100"],
                                  capture_output=True, text=True, env=dict(os.environ, GH_TOKEN=os.environ["RELEASES_TOKEN"]))
-              if r.returncode:
-                  raise SystemExit(f"::error::Could not list the releases of {repo} (exit {r.returncode}); "
-                                   "nothing is triaged this run")
-              return [x["tag_name"] for page in json.loads(r.stdout or "[]") for x in page
-                      if not x.get("draft") and not x.get("prerelease")]
+              if r.returncode == 0:
+                  pages = json.loads(r.stdout or "[]")
+              else:
+                  # The list is public; read it without a token if the run's token is refused.
+                  print(f"::warning::Listing the releases of {repo} with the run's token failed; trying without one")
+                  pages = public_pages(f"https://api.github.com/repos/{repo}/releases?per_page=100")
+                  if pages is None:
+                      raise SystemExit(f"::error::Could not list the releases of {repo}; nothing is triaged this run")
+              return [x["tag_name"] for page in pages for x in page if not x.get("draft") and not x.get("prerelease")]
+
+          def public_pages(url, limit=10):
+              """Pages of a public GitHub API list, without a token, following Link headers; None on any error."""
+              pages = []
+              try:
+                  while url and len(pages) < limit:
+                      with urllib.request.urlopen(urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"}),
+                                                  timeout=30) as resp:
+                          pages.append(json.load(resp))
+                          nxt = re.search(r'<([^>]+)>;\s*rel="next"', resp.headers.get("Link") or "")
+                          url = nxt.group(1) if nxt else None
+              except (OSError, ValueError):
+                  return None
+              return pages
           # The Kubernetes manifests in a report are copied into files, exactly as written, so the agent applies them
           # by path instead of retyping them. The text is untrusted: the files are only written, never run, their
           # names come from this script, and their number and size (in bytes, as lab-kubectl checks it) are capped.
@@ -838,7 +860,7 @@ jobs:
               print(f"{sum(len(t['manifests']) for t in todo)} manifest files from the reports to triage")
               published = [{"ghsa_id": a["ghsa_id"], "cve_id": a.get("cve_id"), "summary": a.get("summary"),
                             "severity": a.get("severity"), "cwe_ids": a.get("cwe_ids")}
-                           for a in (gh_list(f"repos/{target}/security-advisories?state=published&per_page=100") or [])][:60]
+                           for a in (gh_list(f"repos/{target}/security-advisories?state=published&per_page=100") or [])]
               print(f"{len(advisories)} unpublished advisories, {len(todo)} to triage")
               os.makedirs("/tmp/security-triage-index", exist_ok=True)
               with open("/tmp/security-triage-index/index.json", "w") as f:
@@ -935,6 +957,7 @@ jobs:
           INDEX_FILE: /tmp/security-triage-index/index.json
           AW_INFO_FILE: /tmp/security-triage-activation/aw_info.json
           AGENT_OUTPUT_FILE: /tmp/security-triage-agent/agent_output.json
+          AGENT_USAGE_FILE: /tmp/security-triage-agent/agent_usage.json
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           AGENT_RESULT: ${{ needs.agent.result }}
           AGENT_TIMED_OUT: ${{ needs.agent.outputs.agentic_engine_timeout }}
@@ -946,7 +969,7 @@ jobs:
           # The posting job's marker format, which collect reads. No fingerprint matches sixteen zeros.
           MARKER = "<!-- security-triage:v1 fingerprint=0000000000000000 classification=unfinished -->"
           CLASSIFICATIONS = {"reproduced", "needs-non-default-config", "not-reproduced", "needs-more-info",
-                             "possible-duplicate"}
+                             "possible-duplicate", "not-tested"}
 
           def load(path, default):
               try:
@@ -974,8 +997,16 @@ jobs:
               if agent_output.get("collectorFailureCause") == "request_rejection":
                   return "The model's response was blocked by its provider's content filter."
               if env.get("AGENT_RESULT") not in ("success", None, ""):
-                  return "The agent job failed."
+                  # The AI-credit limit stops the agent this way too; the amount spent tells a maintainer which.
+                  spent = credits(env.get("AGENT_USAGE_FILE", ""))
+                  return "The agent job failed" + (f" after spending {spent:.0f} AI credits." if spent else ".")
               return "The agent stopped without recording a verdict for this advisory."
+
+          def credits(path):
+              try:
+                  return float(load(path, {}).get("ai_credits") or 0)
+              except (TypeError, ValueError):
+                  return 0
 
           def render(why, team, run_url):
               lines = [
@@ -1147,6 +1178,10 @@ report that reproduces there and is gone on a newer release is still `reproduced
   instead.
 - `needs-more-info`: the report lacks what is needed to try (no policy, no resource, no version, no steps). Ask for it.
 - `possible-duplicate`: it matches a published advisory. Name it in `related_advisories`.
+- `not-tested`: the report is about something the CLI and the lab cannot run, such as the project's CI workflows,
+  another product, its website, TLS settings of a deployment, or image verification that needs signing keys and a
+  registry. Say exactly what was missing, call `report_missing_tool` naming it, and reason from the code paths and
+  documents the report names. Never use it for a report you could have run.
 
 When unsure between two, choose the one that asks a person to look harder: `needs-more-info` over `not-reproduced`,
 `reproduced` over `needs-non-default-config`. Never call a report invalid or suggest closing it.

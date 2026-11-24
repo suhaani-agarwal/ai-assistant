@@ -119,6 +119,58 @@ class Collect(unittest.TestCase):
         self.assertEqual(len(todo[0]["description"]), self.s["MAX_DESCRIPTION"])
 
 
+    def test_manifests_in_code_blocks_and_heredocs_are_copied_exactly_and_the_rest_left_out(self):
+        policy = "apiVersion: kyverno.io/v1\nkind: ClusterPolicy\nmetadata:\n  name: probe-policy\nspec:\n  rules: []  # keep me"
+        pod = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: probe\n  namespace: tenant\nspec: {}"
+        desc = ("Steps:\n```yaml\n" + policy + "\n---\n" + pod + "\n```\n"
+                "Then:\n```bash\nkubectl get pods\ncat <<'EOF' | kubectl apply -f -\n"
+                "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: other\nEOF\n```\n"
+                "Values:\n```yaml\nreplicaCount: 2\n```\n"
+                "Broken:\n```yaml\nkind: [\n```\n"
+                "Again:\n~~~\n" + policy + "\n~~~\n")
+        found, notes = self.s["manifests_from"]([("description", desc)])
+        self.assertEqual([m["file"] for m in found],
+                         ["01-ClusterPolicy-probe-policy.yaml", "02-Pod-probe.yaml", "03-Namespace-other.yaml"])
+        self.assertEqual(found[0]["text"], policy + "\n")
+        self.assertEqual((found[1]["namespace"], found[1]["source"]), ("tenant", "description, code block 1"))
+        self.assertEqual(found[2]["source"], "description, code block 2")
+        self.assertEqual(notes, ["description, code block 4: not valid YAML, left out"])
+
+    def test_links_an_editor_added_inside_yaml_are_undone_and_kubeconfigs_left_out(self):
+        doc = ("```yaml\napiVersion: [rbac.authorization.k8s.io/v1](http://rbac.authorization.k8s.io/v1)\nkind: Role\n"
+               "metadata:\n  name: r\nrules:\n- apiGroups: [\"[kyverno.io](http://kyverno.io/)\"]\n"
+               "  note: \"[docs](https://kyverno.io/docs)\"\n```\n"
+               "```yaml\napiVersion: v1\nkind: Config\nclusters: []\nusers: []\n```")
+        found, _ = self.s["manifests_from"]([("description", doc)])
+        self.assertEqual([m["file"] for m in found], ["01-Role-r.yaml"])
+        self.assertIn("apiVersion: rbac.authorization.k8s.io/v1\n", found[0]["text"])
+        self.assertIn('apiGroups: ["kyverno.io"]', found[0]["text"])
+        self.assertIn("[docs](https://kyverno.io/docs)", found[0]["text"])
+        self.assertIn("repaired", found[0])
+
+    def test_a_longer_fence_holds_a_shorter_one_and_an_unclosed_block_runs_to_the_end(self):
+        blocks = self.s["fenced_blocks"]("````md\n```yaml\nx: 1\n```\n````\n  ```yml\n  a: 1\n  b: 2")
+        self.assertEqual(blocks, [("md", "```yaml\nx: 1\n```"), ("yml", "a: 1\nb: 2")])
+
+    def test_a_kind_or_name_in_the_report_cannot_steer_the_file_path(self):
+        doc = "```yaml\napiVersion: v1\nkind: ../../etc\nmetadata:\n  name: ../../../root/.ssh/x\n```"
+        found, _ = self.s["manifests_from"]([("description", doc)])
+        self.assertEqual(found[0]["file"], "01-etc-root_.ssh_x.yaml")
+
+    def test_manifests_are_written_per_advisory_from_the_whole_description_and_listed_on_its_entry(self):
+        policy = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: canary\n"
+        adv = advisory(description="a" * 20000 + "\n```yaml\n" + policy + "```\n")
+        reply = comment("reporter", "```yaml\napiVersion: v1\nkind: Secret\nmetadata:\n  name: s\n```")
+        todo, _ = self.s["pick"]([adv], self.comments({GHSA: [reply]}), 3)
+        with tempfile.TemporaryDirectory() as d:
+            self.s["write_manifests"](todo, [adv], self.comments({GHSA: [reply]}), d)
+            files = [m["file"] for m in todo[0]["manifests"]]
+            self.assertEqual(files, [f"{GHSA}/01-ConfigMap-canary.yaml", f"{GHSA}/02-Secret-s.yaml"])
+            self.assertEqual(pathlib.Path(d, files[0]).read_text(), policy)
+            self.assertEqual(todo[0]["manifests"][1]["source"], "comment 1, code block 1")
+            self.assertNotIn("text", todo[0]["manifests"][0])
+            self.assertTrue(pathlib.Path(d, "README").exists())
+
 class Post(unittest.TestCase):
     def setUp(self):
         self.s = script("def render(")
@@ -331,6 +383,29 @@ class Lab(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+    def test_a_manifest_file_is_read_by_the_tool_and_piped_but_only_from_the_allowed_directories(self):
+        inputs = []
+        with tempfile.TemporaryDirectory() as manifests, tempfile.TemporaryDirectory() as repro, \
+             tempfile.TemporaryDirectory() as outside, \
+             mock.patch.dict(self.s, {"FILE_ROOTS": (manifests, repro)}), \
+             mock.patch.object(self.s["subprocess"], "run",
+                               lambda cmd, **kw: inputs.append(kw.get("input")) or subprocess.CompletedProcess(cmd, 0, "", "")), \
+             mock.patch("sys.stdout"):
+            os.makedirs(os.path.join(manifests, GHSA))
+            pathlib.Path(manifests, GHSA, "01-Pod-probe.yaml").write_text("kind: Pod\n")
+            pathlib.Path(repro, "mine.yaml").write_text("kind: Role\n")
+            pathlib.Path(outside, "secret.yaml").write_text("token: x\n")
+            os.symlink(os.path.join(outside, "secret.yaml"), os.path.join(repro, "link.yaml"))
+            kubectl = self.s["kubectl"]
+            self.assertEqual(kubectl("apply -f -", file=f"{GHSA}/01-Pod-probe.yaml"), 0)
+            self.assertEqual(kubectl("apply -f -", file=os.path.join(repro, "mine.yaml")), 0)
+            for bad in (os.path.join(outside, "secret.yaml"), f"../{os.path.basename(outside)}/secret.yaml",
+                        os.path.join(repro, "link.yaml"), "/etc/hosts", f"{GHSA}/missing.yaml"):
+                self.assertEqual(kubectl("apply -f -", file=bad), 2, bad)
+            self.assertEqual(kubectl("get pods", file=f"{GHSA}/01-Pod-probe.yaml"), 2)
+            self.assertEqual(kubectl("apply -f -", "kind: Pod\n# end\n", file=f"{GHSA}/01-Pod-probe.yaml"), 2)
+        self.assertEqual(inputs, ["kind: Pod\n", "kind: Role\n"])
 
 class Unfinished(unittest.TestCase):
     def setUp(self):

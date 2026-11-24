@@ -6,8 +6,9 @@
 # How the agent reaches it: the agent's sandbox has no Docker and no route to the machine, so the cluster is driven
 # through the mcp-scripts tools below. Those run on the machine, outside the sandbox, but each one runs a fixed
 # program (kind, helm or kubectl) on checked arguments and never a shell command the agent wrote. kubectl reads
-# manifests only from the agent's input, never from a path on the machine, and the commands that would reach the
-# machine itself (cp, proxy, port-forward, config, plugin) are refused.
+# manifests only from its stdin, never from a path on the machine: the agent's text, or a file the tool itself reads
+# from the run's report manifests or the agent's scratch directory and nowhere else. The commands that would reach
+# the machine itself (cp, proxy, port-forward, config, plugin) are refused.
 #
 # Pods in the cluster can reach the internet, which pulls images and lets reports that need an outside listener be
 # tested. Before this runs on real reports from the private repository, decide whether to cut that egress once the
@@ -46,6 +47,10 @@ steps:
       # A manifest must end with this line. The model can be stopped part way through a tool call and the call still
       # runs with what it had written; a cut-off manifest cannot carry the last line, so it is refused, not applied.
       END_MARKER = "# end"
+      # Where `file` may point: the manifests copied from the reports, and the agent's scratch directory. A relative
+      # path is under the first.
+      FILE_ROOTS = ("/tmp/gh-aw/security-triage/manifests", "/tmp/gh-aw/security-triage/repro")
+      MAX_FILE = 256000
 
       # kubectl subcommands the agent may run. Everything here acts on the cluster only.
       KUBECTL_VERBS = {
@@ -113,6 +118,19 @@ steps:
                   return True
           return False
 
+      def read_manifest_file(path):
+          """The text of a manifest file under FILE_ROOTS, or a ValueError saying why it is refused."""
+          p = (path or "").strip()
+          full = os.path.realpath(p if os.path.isabs(p) else os.path.join(FILE_ROOTS[0], p))
+          if not any(full.startswith(os.path.realpath(r) + os.sep) for r in FILE_ROOTS):
+              raise ValueError(f"file must be under {' or '.join(FILE_ROOTS)}")
+          if not re.search(r"\.(ya?ml|json)$", full) or not os.path.isfile(full):
+              raise ValueError(f"no .yaml, .yml or .json file at {p}")
+          if os.path.getsize(full) > MAX_FILE:
+              raise ValueError(f"file is over {MAX_FILE} bytes")
+          with open(full) as f:
+              return f.read()
+
       def chart_version(app_version, entries):
           """The chart version that ships app_version, from `helm search repo --versions -o json` entries."""
           stable = [e for e in entries if "-" not in e.get("app_version", "")]
@@ -172,12 +190,19 @@ steps:
           app = next((e.get("app_version") for e in entries if e.get("version") == cv), "")
           return out(code, f"chart {chart} {cv} (release {app})\n{text}\n{pods}")
 
-      def kubectl(args, stdin=""):
+      def kubectl(args, stdin="", file=""):
           try:
               tokens = check_kubectl(args)
+              if file:
+                  if stdin:
+                      raise ValueError("give the manifest as stdin or as file, not both")
+                  if not reads_manifest(tokens):
+                      raise ValueError("file is for a manifest: use it with -f -")
+                  stdin = read_manifest_file(file)
           except ValueError as e:
               return out(2, str(e))
-          if stdin and reads_manifest(tokens):
+          # A file is read whole by this tool, so only typed stdin can be cut off.
+          if stdin and not file and reads_manifest(tokens):
               # Only trailing whitespace is ignored: an indented `# end` can be the last line of a cut-off block.
               lines = [l.rstrip() for l in stdin.splitlines() if l.strip()]
               if not lines or lines[-1] != END_MARKER:
@@ -194,7 +219,7 @@ steps:
           if cmd == "install":
               return install(env("INPUT_VERSION", ""), env("INPUT_VALUES", ""))
           if cmd == "kubectl":
-              return kubectl(env("INPUT_ARGS", ""), env("INPUT_STDIN", ""))
+              return kubectl(env("INPUT_ARGS", ""), env("INPUT_STDIN", ""), env("INPUT_FILE", ""))
           return out(2, f"unknown command {cmd!r}")
 
       if __name__ == "__main__" and os.environ.get("SECURITY_TRIAGE_NO_MAIN") != "1":
@@ -239,7 +264,8 @@ mcp-scripts:
     description: >-
       Run one kubectl command against the lab cluster, e.g. `apply -f -` with the manifest in stdin, `get pods -A`,
       `auth can-i get secrets -n other --as=system:serviceaccount:tenant:probe-user`, or `logs -n kyverno deploy/x`.
-      Impersonate users with --as. Manifests go in stdin, never as a file path. Returns the exit code and output.
+      Impersonate users with --as. A manifest goes in stdin, or as `file` for one of the report's manifest files or
+      one in your scratch directory. Returns the exit code and output.
     inputs:
       args:
         type: string
@@ -249,6 +275,12 @@ mcp-scripts:
         type: string
         required: false
         description: "Text piped to kubectl. For a manifest (`-f -`), its last line must be `# end`, unindented."
+      file:
+        type: string
+        required: false
+        description: >-
+          Instead of stdin, a manifest file to pipe to kubectl with `-f -`: a report manifest as listed (e.g.
+          GHSA-xxxx-xxxx-xxxx/01-ClusterPolicy-name.yaml), or a full path in your scratch directory. No `# end` needed.
     run: python3 -I "$RUNNER_TEMP/security-triage-lab/lab.py" kubectl
     timeout: 180
 ---
@@ -265,8 +297,11 @@ controller crashing. Use the CLI for what the CLI can show on its own.
 - `lab-install` installs a release with Helm: a version such as `v1.16.1`, a minor such as `v1.16` for its newest
   patch, or `latest`. Its output names the release it installed. Pass Helm values when the report needs a non-default
   setting, and say in your verdict which ones you set and why.
-- `lab-kubectl` runs one kubectl command. Put manifests in `stdin` with `-f -`, and end `stdin` with the line `# end`:
-  if that line is missing, the input was cut off and nothing is applied, so send it again in full. Act as a
+- `lab-kubectl` runs one kubectl command. For a manifest from the report, use `-f -` with `file` set to its listed
+  path, and do not retype it. The same works for a file you wrote in your scratch directory, so you can apply it
+  again on the next release without sending it twice. Otherwise put the manifest in `stdin` with `-f -`, and end
+  `stdin` with the line `# end`: if that line is missing, the input was cut off and nothing is applied, so send it
+  again in full. Act as a
   restricted user with `--as=system:serviceaccount:<namespace>:<name>` after creating that service account and its
   Role and RoleBinding.
 

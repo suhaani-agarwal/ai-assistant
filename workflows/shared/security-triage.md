@@ -72,9 +72,14 @@ tools:
     - "jq"
     - "yq"
 
-# Runs outside the sandbox, before the agent, in the agent job: install the two CLI versions and fetch the context
-# documents into files the agent reads.
+# Runs outside the sandbox, before the agent, in the agent job: fetch the report manifests the collect job extracted,
+# install the two CLI versions and fetch the context documents into files the agent reads.
 steps:
+  - name: Download the report manifests
+    uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+    with:
+      name: security-triage-manifests
+      path: /tmp/gh-aw/security-triage/manifests
   - name: Install the CLI and fetch context
     env:
       GH_TOKEN: ${{ github.token }}
@@ -476,9 +481,141 @@ jobs:
         run: |
           python3 - <<'PY'
           import hashlib, json, os, re, subprocess
+          try:
+              import yaml
+          except ImportError:
+              yaml = None
 
           MARKER = re.compile(r"<!-- security-triage:v1 fingerprint=([0-9a-f]{16}) classification=([a-z-]+) -->")
           MAX_DESCRIPTION, MAX_COMMENT, MAX_COMMENTS = 12000, 3000, 10
+          # The Kubernetes manifests in a report are copied into files, exactly as written, so the agent applies them
+          # by path instead of retyping them. The text is untrusted: the files are only written, never run, their
+          # names come from this script, and their number and size are capped.
+          MANIFESTS_DIR = "/tmp/security-triage-manifests"
+          MAX_MANIFESTS, MAX_DOC, MAX_TOTAL, MAX_NOTES = 40, 64000, 256000, 10
+          FENCE = re.compile(r"^(\s*)(`{3,}|~{3,})(.*)$")
+          HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+          DOC_START = re.compile(r"^---(\s.*)?$")
+          # Some editors turn a domain into a link even inside a code block, e.g.
+          # `apiVersion: [kyverno.io/v1](http://kyverno.io/v1)`. Only a link whose text is its own address is undone.
+          AUTOLINK = re.compile(r"\[([^\[\]\s]+)\]\(https?://([^()\s]+?)/?\)")
+
+          def unlink(text):
+              return AUTOLINK.sub(lambda m: m.group(1) if m.group(2).rstrip("/") == m.group(1).rstrip("/") else m.group(0), text)
+
+          def fenced_blocks(text):
+              """(language, content) of each ``` or ~~~ code block: it closes on a fence of the same character that is at
+              least as long, or at the end of the text."""
+              blocks, lines, i = [], (text or "").splitlines(), 0
+              while i < len(lines):
+                  m = FENCE.match(lines[i])
+                  if not m or (m.group(2)[0] == "`" and "`" in m.group(3)):
+                      i += 1
+                      continue
+                  indent, fence, info = len(m.group(1)), m.group(2), m.group(3).strip()
+                  body, i = [], i + 1
+                  while i < len(lines):
+                      c = re.match(r"^\s*(`{3,}|~{3,})\s*$", lines[i])
+                      if c and c.group(1)[0] == fence[0] and len(c.group(1)) >= len(fence):
+                          break
+                      line = lines[i]
+                      body.append(line[min(indent, len(line) - len(line.lstrip(" "))):])
+                      i += 1
+                  blocks.append((info.split()[0].lower() if info else "", "\n".join(body)))
+                  i += 1
+              return blocks
+
+          def heredocs(block):
+              """The bodies of shell here-documents in a block, as in `kubectl apply -f - <<EOF ... EOF`."""
+              out, lines, i = [], block.splitlines(), 0
+              while i < len(lines):
+                  m = HEREDOC.search(lines[i])
+                  i += 1
+                  if not m:
+                      continue
+                  body = []
+                  while i < len(lines) and lines[i].strip() != m.group(2):
+                      body.append(lines[i])
+                      i += 1
+                  out.append("\n".join(body))
+                  i += 1
+              return out
+
+          def documents(text):
+              """The YAML documents in a text, split on `---` lines, each kept exactly as written."""
+              docs, cur = [], []
+              for line in text.splitlines():
+                  if DOC_START.match(line) or line.rstrip() == "...":
+                      docs.append("\n".join(cur))
+                      cur = []
+                  else:
+                      cur.append(line)
+              docs.append("\n".join(cur))
+              return [d for d in docs if d.strip()]
+
+          def safe_name(value, n=40):
+              return re.sub(r"[^A-Za-z0-9.-]", "_", str(value or ""))[:n].strip("._-") or "unnamed"
+
+          def manifests_from(sources):
+              """The Kubernetes objects in the code blocks of [(label, text)], and notes on what was left out."""
+              if yaml is None:
+                  return [], ["the manifests were not extracted: PyYAML is not installed on the runner"]
+              found, notes, seen, total = [], [], set(), 0
+              for label, text in sources:
+                  for b, (lang, block) in enumerate(fenced_blocks(text), 1):
+                      where = f"{label}, code block {b}"
+                      for doc in [d for part in (heredocs(block) or [block]) for d in documents(part)]:
+                          fixed = unlink(doc)
+                          repaired, doc = fixed != doc, fixed
+                          if len(found) >= MAX_MANIFESTS or len(doc) > MAX_DOC or total + len(doc) > MAX_TOTAL:
+                              notes.append(f"{where}: left out, over the size or count limit")
+                              continue
+                          try:
+                              obj = yaml.safe_load(doc)
+                          except Exception:
+                              if lang in ("yaml", "yml"):
+                                  notes.append(f"{where}: not valid YAML, left out")
+                              continue
+                          if not (isinstance(obj, dict) and obj.get("apiVersion") and obj.get("kind")):
+                              continue
+                          if obj.get("kind") == "Config" and "clusters" in obj:
+                              continue  # a kubeconfig, not something to apply
+
+                          if doc.strip() in seen:
+                              continue
+                          seen.add(doc.strip())
+                          total += len(doc)
+                          meta = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+                          name = meta.get("name") or meta.get("generateName") or ""
+                          found.append({
+                              "file": f"{len(found) + 1:02d}-{safe_name(obj['kind'])}-{safe_name(name)}.yaml",
+                              "kind": str(obj["kind"])[:60], "name": str(name)[:100],
+                              "namespace": str(meta.get("namespace") or "")[:100], "source": where,
+                              **({"repaired": "links the report's editor added were removed"} if repaired else {}),
+                              "text": doc.strip("\n") + "\n",
+                          })
+              return found, list(dict.fromkeys(notes))[:MAX_NOTES]
+
+          def write_manifests(todo, advisories, comments_for, root=MANIFESTS_DIR):
+              """Write each picked advisory's manifests under root/<GHSA>/ and list them on its entry for the agent.
+              They come from the whole description and the same comments the agent sees, before either is cut."""
+              by_id = {a["ghsa_id"]: a for a in advisories}
+              os.makedirs(root, exist_ok=True)
+              with open(os.path.join(root, "README"), "w") as f:
+                  f.write("Kubernetes manifests copied from each report, one directory per advisory.\n")
+              for item in todo:
+                  g = item["ghsa_id"]
+                  humans = [c for c in (comments_for(g) or []) if (c.get("user") or {}).get("type") != "Bot"][-MAX_COMMENTS:]
+                  sources = [("description", by_id[g].get("description") or "")]
+                  sources += [(f"comment {i}", c.get("body") or "") for i, c in enumerate(humans, 1)]
+                  found, notes = manifests_from(sources)
+                  if found:
+                      os.makedirs(os.path.join(root, g), exist_ok=True)
+                  for m in found:
+                      with open(os.path.join(root, g, m["file"]), "w") as f:
+                          f.write(m.pop("text"))
+                      m["file"] = f"{g}/{m['file']}"
+                  item["manifests"], item["manifest_notes"] = found, notes
 
           def gh_list(path):
               r = subprocess.run(["gh", "api", "--paginate", "--slurp", path], capture_output=True, text=True)
@@ -552,7 +689,13 @@ jobs:
               advisories = []
               for state in json.loads(os.environ["STATES"]):
                   advisories += gh_list(f"repos/{target}/security-advisories?state={state}&per_page=100") or []
-              todo, index = pick(advisories, lambda g: gh_list(f"repos/{target}/security-advisories/{g}/comments?per_page=100"), limit, only)
+              cache = {}
+              def comments_for(g):
+                  if g not in cache:
+                      cache[g] = gh_list(f"repos/{target}/security-advisories/{g}/comments?per_page=100")
+                  return cache[g]
+              todo, index = pick(advisories, comments_for, limit, only)
+              write_manifests(todo, advisories, comments_for)
               published = [{"ghsa_id": a["ghsa_id"], "cve_id": a.get("cve_id"), "summary": a.get("summary"),
                             "severity": a.get("severity"), "cwe_ids": a.get("cwe_ids")}
                            for a in (gh_list(f"repos/{target}/security-advisories?state=published&per_page=100") or [])][:60]
@@ -572,6 +715,13 @@ jobs:
         with:
           name: security-triage-index
           path: /tmp/security-triage-index/index.json
+          retention-days: 1
+          if-no-files-found: error
+      - name: Keep the report manifests for the agent
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-triage-manifests
+          path: /tmp/security-triage-manifests
           retention-days: 1
           if-no-files-found: error
   agent:
@@ -767,6 +917,13 @@ ${{ needs.collect.outputs.json }}
 - Context documents in `/tmp/gh-aw/security-triage/context/`: the project's threat model and security guidance,
   and any reference documents the project adds. Read the threat model once, before the first advisory: it says what
   the project treats as the operator's responsibility. Search the reference documents with `grep` when you need them.
+- The report's manifests as files. Each advisory's `manifests` lists the Kubernetes objects found in the code blocks
+  of its description and comments, each copied exactly as written to
+  `/tmp/gh-aw/security-triage/manifests/<file>`, with its kind, name, namespace and the block it came from.
+  `manifest_notes` says what was left out. Use these files as they are: pass the path to the CLI, or give it as
+  `file` to `lab-kubectl` if there is a lab. Do not retype them. Write your own version in your scratch directory
+  only when one must change to run, and say what you changed. A report whose YAML is not in a code block, or is
+  only behind a link, has no files: work from its text.
 - A scratch directory per advisory: `/tmp/gh-aw/security-triage/repro/<GHSA ID>/`. Write policies, resources and
   test files there with the edit tool.
 - No network from your own shell. If a section below describes a lab cluster, use it for anything that needs a
@@ -781,7 +938,7 @@ ${{ needs.collect.outputs.json }}
    power (for example, they can already edit policies or the controller's configuration), or the behaviour is
    documented as the operator's choice, note the section.
 3. Reproduce it when the report gives enough to do so: with the CLI on both releases, or in the lab on the reported
-   release and the latest. Use the report's own policies and resources where it gives them, adapted only as far as
+   release and the latest. Use the report's own policies and resources (its manifest files) where it gives them, adapted only as far as
    needed to run. Keep notes of each command, its exit code and the lines of output that matter. Work in this order:
    a. Pick the report's main claim: the one impact the rest depends on.
    b. Reproduce that claim on the reported release, and put it in `result_release`. If neither the CLI nor the lab

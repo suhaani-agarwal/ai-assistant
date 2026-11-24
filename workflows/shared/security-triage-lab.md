@@ -299,10 +299,6 @@ steps:
           except ValueError as e:
               return out(2, str(e))
           canary = "canary-" + secrets.token_hex(4)
-          # An object that already exists (kube-system/coredns, say) is left as it is: writing the canary into it could
-          # break the lab. Its own value then plays the canary's part.
-          existing = [kind for kind in ("configmap", "secret")
-                      if run(["kubectl", "get", kind, name, "-n", other, "-o", "name"], timeout=60)[0] == 0]
           objects = [
               {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns}},
               {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": other}},
@@ -314,18 +310,30 @@ steps:
                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": f"{user}-role"},
                "subjects": [{"kind": "ServiceAccount", "name": user, "namespace": ns}]},
           ]
-          if "configmap" not in existing:
-              objects.append({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": name, "namespace": other},
-                              "data": {key: canary}})
-          if "secret" not in existing:
-              objects.append({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name, "namespace": other},
-                              "stringData": {key: canary}})
           code, applied = run(["kubectl", "--request-timeout=90s", "apply", "-f", "-"],
                               stdin=json.dumps({"apiVersion": "v1", "kind": "List", "items": objects}), timeout=150)
           log(f"lab-tenant namespace={ns} other_namespace={other} user={user} canary={other}/{name}:{key} "
               f"rules={rules.strip()}", code)
           if code:
               return out(code, applied)
+          # The canary objects are created, never applied: an object that already exists (kube-system/coredns, say) is
+          # left as it is, since writing the canary into it could break the lab, and its own value plays the canary's
+          # part. Create-only also covers an object that appears in the meantime. Any other error stops here.
+          canaries = {
+              "configmap": {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": name, "namespace": other},
+                            "data": {key: canary}},
+              "secret": {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name, "namespace": other},
+                         "stringData": {key: canary}},
+          }
+          existing = []
+          for kind, obj in canaries.items():
+              c, created = run(["kubectl", "--request-timeout=90s", "create", "-f", "-"], stdin=json.dumps(obj), timeout=150)
+              if c == 0:
+                  applied += created
+              elif "AlreadyExists" in created:
+                  existing.append(kind)
+              else:
+                  return out(c, f"the user was created, but the canary {kind} {other}/{name} was not:\n{created}")
           as_user = f"system:serviceaccount:{ns}:{user}"
           checks = [(v, r, ns) for rule in parsed for v in rule["verbs"] if v != "*"
                     for r in [f"{n}.{rule['apiGroups'][0]}" if rule["apiGroups"][0] else n for n in rule["resources"]]][:20]

@@ -456,8 +456,6 @@ class Lab(unittest.TestCase):
     def test_tenant_builds_the_user_and_canary_and_reports_what_it_can_do(self):
         calls = []
         def fake(cmd, **kw):
-            if cmd[:2] == ["kubectl", "get"]:
-                return subprocess.CompletedProcess(cmd, 1, "", "NotFound")  # a fresh lab: no canary objects yet
             calls.append((cmd, kw.get("input")))
             return subprocess.CompletedProcess(cmd, 0, "no\n" if "can-i" in cmd else "applied\n", "")
         with tempfile.TemporaryDirectory() as d, \
@@ -467,7 +465,9 @@ class Lab(unittest.TestCase):
             self.assertEqual(self.s["tenant"]("Bad_NS", "get:pods"), 2)
             self.assertEqual(self.s["tenant"]("same", "get:pods", "same"), 2)
             printed = "".join(c.args[0] for c in stdout.write.call_args_list)
-        items = json.loads(calls[0][1])["items"]
+        # The user and its permissions in one apply, then the two canary objects created one by one.
+        items = json.loads(calls[0][1])["items"] + [json.loads(calls[1][1]), json.loads(calls[2][1])]
+        self.assertEqual([c[0][2] for c in calls[:3]], ["apply", "create", "create"])
         self.assertEqual([i["kind"] for i in items],
                          ["Namespace", "Namespace", "ServiceAccount", "Role", "RoleBinding", "ConfigMap", "Secret"])
         canary = items[5]["data"]["value"]
@@ -482,8 +482,6 @@ class Lab(unittest.TestCase):
     def test_tenant_uses_the_reports_own_names_so_its_manifests_apply_unchanged(self):
         calls = []
         def fake(cmd, **kw):
-            if cmd[:2] == ["kubectl", "get"]:
-                return subprocess.CompletedProcess(cmd, 1, "", "NotFound")
             calls.append(kw.get("input"))
             return subprocess.CompletedProcess(cmd, 0, "yes\n" if "can-i" in cmd else "applied\n", "")
         with mock.patch.object(self.s["subprocess"], "run", fake), mock.patch("sys.stdout") as stdout:
@@ -492,20 +490,22 @@ class Lab(unittest.TestCase):
             self.assertEqual(self.s["tenant"]("default", "get:pods", "kube-system", "u", "target-cm", "bad key"), 2)
             printed = "".join(c.args[0] for c in stdout.write.call_args_list)
         items = json.loads(calls[0])["items"]
-        cm, secret = items[5], items[6]
+        cm, secret = json.loads(calls[1]), json.loads(calls[2])
         self.assertEqual((cm["metadata"], list(cm["data"])), ({"name": "target-cm", "namespace": "kube-system"}, ["key"]))
         self.assertEqual(list(secret["stringData"]), ["key"])
         self.assertEqual(items[2]["metadata"], {"name": "probe-policy-admin", "namespace": "default"})
         self.assertIn("under key `key` in ConfigMap kube-system/target-cm", printed)
 
     def test_canary_names_may_be_subdomains_and_existing_objects_are_left_unchanged(self):
-        applied = []
+        created = []
         def fake(cmd, **kw):
-            if cmd[:2] == ["kubectl", "get"]:
-                return subprocess.CompletedProcess(cmd, 0 if cmd[2] == "configmap" else 1, "", "")
             if "can-i" in cmd:
                 return subprocess.CompletedProcess(cmd, 1, "no\n", "")
-            applied.append(json.loads(kw["input"]))
+            if "create" in cmd:
+                obj = json.loads(kw["input"])
+                if obj["kind"] == "ConfigMap" and obj["metadata"]["name"] == "coredns":
+                    return subprocess.CompletedProcess(cmd, 1, "", 'Error from server (AlreadyExists): configmaps "coredns"')
+                created.append((obj["kind"], obj["metadata"]["name"]))
             return subprocess.CompletedProcess(cmd, 0, "applied\n", "")
         with mock.patch.object(self.s["subprocess"], "run", fake), mock.patch("sys.stdout") as stdout:
             self.assertEqual(self.s["tenant"]("default", "get:pods", "kube-system", "u", "coredns", "Corefile"), 0)
@@ -513,11 +513,21 @@ class Lab(unittest.TestCase):
             self.assertEqual(self.s["tenant"]("default", "get:pods", "kube-system", "u", "Bad.Name"), 2)
             self.assertEqual(self.s["tenant"]("default", "get:pods", "kube-system", "u", "a" * 254), 2)
             printed = "".join(c.args[0] for c in stdout.write.call_args_list)
-        kinds = [[(i["kind"], i["metadata"]["name"]) for i in a["items"][5:]] for a in applied]
-        self.assertEqual(kinds[0], [("Secret", "coredns")])  # the existing ConfigMap is not touched
+        # The existing ConfigMap is not written; everything else is created, never applied over.
+        self.assertEqual(created, [("Secret", "coredns"), ("ConfigMap", "private.config"), ("Secret", "private.config")])
         self.assertIn("already existed and left unchanged, so its own value is the canary: ConfigMap kube-system/coredns",
                       printed)
-        self.assertEqual(kinds[1], [("Secret", "private.config")])
+
+    def test_a_canary_that_cannot_be_created_stops_the_setup(self):
+        def fake(cmd, **kw):
+            if "create" in cmd:
+                return subprocess.CompletedProcess(cmd, 1, "", "Unable to connect to the server: i/o timeout")
+            return subprocess.CompletedProcess(cmd, 0, "applied\n", "")
+        with mock.patch.object(self.s["subprocess"], "run", fake), mock.patch("sys.stdout") as stdout:
+            self.assertEqual(self.s["tenant"]("default", "get:pods", "kube-system", "u", "coredns", "Corefile"), 1)
+            printed = "".join(c.args[0] for c in stdout.write.call_args_list)
+        self.assertIn("was not:", printed)
+        self.assertNotIn("what the user can do", printed)
 
     def test_inline_values_are_kept_out_of_the_log(self):
         r = lambda a: " ".join(self.s["redact"](a.split()))

@@ -114,6 +114,35 @@ class Collect(unittest.TestCase):
         todo, _ = self.s["pick"]([advisory(), old], self.comments({GHSA: [mine]}), 3, GHSA)
         self.assertEqual([t["ghsa_id"] for t in todo], [GHSA])
 
+    RELEASES = ["v1.20.0", "v1.19.2", "v1.19.1", "v1.19.0", "v1.18.2", "v1.18.1", "v1.17.2", "v1.16.4", "v1.16.2",
+                "v1.16.1", "v1.13.0", "v1.12.7"]
+
+    def rel(self, *ranges):
+        return self.s["reported_release"]([{"vulnerable_version_range": r} for r in ranges], self.RELEASES)
+
+    def test_the_reported_release_is_the_newest_release_inside_the_range(self):
+        # Range formats copied from published Kyverno advisories.
+        self.assertEqual(self.rel("<= 1.18.1"), "v1.18.1")
+        self.assertEqual(self.rel("< 1.19.1"), "v1.19.0")
+        self.assertEqual(self.rel("<=1.19.1"), "v1.19.1")
+        self.assertEqual(self.rel(">= 1.17.0, <= 1.19.1"), "v1.19.1")
+        self.assertEqual(self.rel(">= 1.16.0, < 1.17.0"), "v1.16.4")
+        self.assertEqual(self.rel("`<= v1.18.2`"), "v1.18.2")
+        self.assertEqual(self.rel("\\>= 1.11.0, \\<= 1.16.2"), "v1.16.2")
+        self.assertEqual(self.rel("1.19.0"), "v1.19.0")
+        self.assertEqual(self.rel("<= 1.18.1", "<= 1.16.2"), "v1.18.1")
+
+    def test_an_unreadable_range_gives_no_reported_release(self):
+        for bad in ("All", "main @ 21168fdf", "NONE", "v1.9.0 - v1.12.7", "", "<= 1.5.0"):
+            self.assertIsNone(self.rel(bad), bad)
+        self.assertIsNone(self.s["reported_release"](None, self.RELEASES))
+
+    def test_the_picked_advisory_carries_its_reported_release(self):
+        adv = advisory(vulnerabilities=[{"package": {"ecosystem": "go", "name": "github.com/kyverno/kyverno"},
+                                         "vulnerable_version_range": "<= 1.18.1"}])
+        todo, _ = self.s["pick"]([adv], self.comments({}), 3, "", self.RELEASES)
+        self.assertEqual(todo[0]["reported_release"], "v1.18.1")
+
     def test_long_descriptions_are_cut(self):
         todo, _ = self.s["pick"]([advisory(description="a" * 50000)], self.comments({}), 3)
         self.assertEqual(len(todo[0]["description"]), self.s["MAX_DESCRIPTION"])
@@ -732,6 +761,20 @@ class Prompt(unittest.TestCase):
     def test_the_closest_release_is_a_fallback_after_trying_and_the_lab_installs_any_release(self):
         self.assertIn("Only if you tried and neither", self.step3)
         self.assertIn("any published release, including ones the\n  CLI does not have", self.lab)
+
+    def test_the_advisories_reach_the_agent_as_a_file_not_a_job_output(self):
+        text = SHARED.read_text()
+        self.assertNotIn("outputs.json", text)
+        self.assertNotIn('"json="', text)
+        self.assertNotIn("<advisories>", self.shared)
+        self.assertIn("/tmp/gh-aw/security-triage/input/advisories.json", self.shared)
+        self.assertIn("name: security-triage-advisories", text)
+        self.assertIn("Check the advisories arrived", text)
+
+    def test_the_agent_tests_the_computed_reported_release_and_has_no_github_tool(self):
+        self.assertIn("advisory's `reported_release`: install exactly that one first", self.step3)
+        self.assertIs(self.shared_front["tools"]["github"], False)
+        self.assertIn("at most two changes the report's text supports", self.step3)
 
     def test_the_verdict_may_be_recorded_early_and_again(self):
         self.assertNotIn("one `post_advisory_verdict` call", self.shared)

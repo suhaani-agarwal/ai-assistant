@@ -55,8 +55,11 @@ import-schema:
     type: string
     default: "None."
 
-# The agent only needs the CLI and its own scratch files. It gets no network beyond the defaults and no GitHub token.
+# The agent only needs the CLI and its own scratch files. It gets no network beyond the defaults and no GitHub tool:
+# gh-aw's default read-only GitHub server would let it read today's code, where a reported flaw may already be fixed,
+# instead of testing the reported release.
 tools:
+  github: false
   edit:
   bash:
     - "${{ github.aw.import-inputs.cli_binary }}-latest:*"
@@ -72,9 +75,28 @@ tools:
     - "jq"
     - "yq"
 
-# Runs outside the sandbox, before the agent, in the agent job: fetch the report manifests the collect job extracted,
-# install the two CLI versions and fetch the context documents into files the agent reads.
+# Runs outside the sandbox, before the agent, in the agent job: fetch the advisories and the report manifests the
+# collect job wrote, install the two CLI versions and fetch the context documents into files the agent reads.
 steps:
+  - name: Download the advisories
+    uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+    with:
+      name: security-triage-advisories
+      path: /tmp/gh-aw/security-triage/input
+  # Fail here rather than let the agent find nothing to do and spend a run on it.
+  - name: Check the advisories arrived
+    env:
+      COUNT: ${{ needs.collect.outputs.count }}
+    run: |
+      python3 - <<'PY'
+      import json, os
+      with open("/tmp/gh-aw/security-triage/input/advisories.json") as f:
+          got = len(json.load(f)["advisories"])
+      want = int(os.environ["COUNT"])
+      if got != want:
+          raise SystemExit(f"::error::collect picked {want} advisories but the agent's input holds {got}")
+      print(f"{got} advisories for the agent")
+      PY
   - name: Download the report manifests
     uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
     with:
@@ -491,7 +513,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions: {}
     outputs:
-      json: ${{ steps.collect.outputs.json }}
       count: ${{ steps.collect.outputs.count }}
     steps:
       - name: Split the target repository
@@ -524,6 +545,9 @@ jobs:
           LIMIT: ${{ github.aw.import-inputs.limit }}
           # Set by a manual run's ghsa_id input, if the workflow declares one: triage that advisory even if unchanged.
           ONLY_GHSA: ${{ inputs.ghsa_id }}
+          # The project's release list is public; the App token is scoped to the target's advisories only.
+          CLI_REPO: ${{ github.aw.import-inputs.cli_repo }}
+          RELEASES_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY'
           import hashlib, json, os, re, subprocess
@@ -531,6 +555,47 @@ jobs:
 
           MARKER = re.compile(r"<!-- security-triage:v1 fingerprint=([0-9a-f]{16}) classification=([a-z-]+) -->")
           MAX_DESCRIPTION, MAX_COMMENT, MAX_COMMENTS = 12000, 3000, 10
+          # The agent's input is a file, not a job output: GitHub drops a job output that happens to contain the text
+          # of any masked secret, and report text can contain anything.
+          ADVISORIES_DIR = "/tmp/security-triage-advisories"
+          RELEASE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+          CONSTRAINT = re.compile(r"^(<=|>=|<|>|==|=)?\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?$")
+
+          def reported_release(vulnerabilities, releases):
+              """The release to test first: the newest published release inside the advisory's version ranges, e.g.
+              `<= 1.18.1` gives v1.18.1 and `< 1.19.1` the newest release below it. None if no range can be read."""
+              def ver(m):
+                  return tuple(int(g or 0) for g in m.groups()[-3:])
+              found = []
+              for vuln in vulnerabilities or []:
+                  text = str((vuln or {}).get("vulnerable_version_range") or "").replace("\\", "").replace("`", "")
+                  parts = [p.strip() for p in text.split(",") if p.strip()]
+                  constraints = []
+                  for part in parts:
+                      m = CONSTRAINT.match(part)
+                      if not m:
+                          constraints = None
+                          break
+                      constraints.append((m.group(1) or "=", ver(m)))
+                  if not constraints:
+                      continue
+                  tests = {"<=": lambda a, b: a <= b, "<": lambda a, b: a < b, ">=": lambda a, b: a >= b,
+                           ">": lambda a, b: a > b, "=": lambda a, b: a == b, "==": lambda a, b: a == b}
+                  for tag in releases:
+                      m = RELEASE.match(tag)
+                      if m and all(tests[op](ver(m), bound) for op, bound in constraints):
+                          found.append((ver(m), tag))
+              return max(found)[1] if found else None
+
+          def releases_of(repo):
+              """Published, non-prerelease release tags of the project, newest first; empty if they cannot be read."""
+              r = subprocess.run(["gh", "api", "--paginate", "--slurp", f"repos/{repo}/releases?per_page=100"],
+                                 capture_output=True, text=True, env=dict(os.environ, GH_TOKEN=os.environ["RELEASES_TOKEN"]))
+              if r.returncode:
+                  print(f"::warning::Could not list the releases of {repo}; reported releases are left empty")
+                  return []
+              return [x["tag_name"] for page in json.loads(r.stdout or "[]") for x in page
+                      if not x.get("draft") and not x.get("prerelease")]
           # The Kubernetes manifests in a report are copied into files, exactly as written, so the agent applies them
           # by path instead of retyping them. The text is untrusted: the files are only written, never run, their
           # names come from this script, and their number and size (in bytes, as lab-kubectl checks it) are capped.
@@ -690,7 +755,7 @@ jobs:
                       return c, m.group(1), m.group(2)
               return None, None, None
 
-          def pick(advisories, comments_for, limit, only=""):
+          def pick(advisories, comments_for, limit, only="", releases=()):
               """Advisories to triage and the index for the posting job. `only` triages that one even if unchanged."""
               todo, index = [], {}
               for adv in sorted(advisories, key=lambda a: a.get("created_at") or ""):
@@ -715,6 +780,7 @@ jobs:
                       "reporter": reporter, "reported_severity": adv.get("severity"),
                       "reported_cvss_vector": cvss_vector(adv), "cwe_ids": adv.get("cwe_ids"),
                       "vulnerabilities": adv.get("vulnerabilities"), "created_at": adv.get("created_at"),
+                      "reported_release": reported_release(adv.get("vulnerabilities"), releases),
                       "previous_bot_result": old_cls,
                       "comments": [{"author": (c.get("user") or {}).get("login"),
                                     "is_reporter": (c.get("user") or {}).get("login") == reporter,
@@ -738,7 +804,7 @@ jobs:
                   if g not in cache:
                       cache[g] = gh_list(f"repos/{target}/security-advisories/{g}/comments?per_page=100")
                   return cache[g]
-              todo, index = pick(advisories, comments_for, limit, only)
+              todo, index = pick(advisories, comments_for, limit, only, releases_of(os.environ["CLI_REPO"]))
               write_manifests(todo, advisories, comments_for)
               # Counts only: the log of a public repository must not carry report text or which reports exist.
               print(f"{sum(len(t['manifests']) for t in todo)} manifest files from the reports to triage")
@@ -749,8 +815,10 @@ jobs:
               os.makedirs("/tmp/security-triage-index", exist_ok=True)
               with open("/tmp/security-triage-index/index.json", "w") as f:
                   json.dump(index, f)
+              os.makedirs(ADVISORIES_DIR, exist_ok=True)
+              with open(os.path.join(ADVISORIES_DIR, "advisories.json"), "w") as f:
+                  json.dump({"advisories": todo, "published": published}, f)
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-                  f.write("json=" + json.dumps({"advisories": todo, "published": published}, separators=(",", ":")) + "\n")
                   f.write(f"count={len(todo)}\n")
 
           if os.environ.get("SECURITY_TRIAGE_NO_MAIN") != "1":
@@ -761,6 +829,13 @@ jobs:
         with:
           name: security-triage-index
           path: /tmp/security-triage-index/index.json
+          retention-days: 1
+          if-no-files-found: error
+      - name: Keep the advisories for the agent
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-triage-advisories
+          path: /tmp/security-triage-advisories/advisories.json
           retention-days: 1
           if-no-files-found: error
       - name: Keep the report manifests for the agent
@@ -947,13 +1022,12 @@ if there is one, the lab. Your only output is `post_advisory_verdict`, for the a
 
 ## The advisories
 
-A step that ran before you chose the advisories for this run. Triage exactly these, no others. `advisories` holds the
-reports; `published` holds the project's published advisories, for spotting duplicates. `previous_bot_result` is
-your earlier result if the report changed since you last looked; reporter comments may answer your questions.
-
-<advisories>
-${{ needs.collect.outputs.json }}
-</advisories>
+A step that ran before you chose the advisories for this run and wrote them to
+`/tmp/gh-aw/security-triage/input/advisories.json`. Read that file first. Triage exactly these, no others.
+`advisories` holds the reports; `published` holds the project's published advisories, for spotting duplicates.
+`reported_release` is the release to test first, worked out from the advisory's version range.
+`previous_bot_result` is your earlier result if the report changed since you last looked; reporter comments may
+answer your questions.
 
 ## What you have
 
@@ -987,11 +1061,14 @@ ${{ needs.collect.outputs.json }}
    where it gives them, unchanged wherever they run, adapted only as far as needed. Keep notes of each command, its
    exit code and the lines of output that matter. This is the order of releases to test; nothing else adds one:
    a. Pick the report's main claim: the one impact the rest depends on.
-   b. Reproduce it on the reported release, and put that release in `result_release`. Only if you tried and neither
-      the CLI nor the lab could run it, use the closest release you can run instead: put that one in `result_release`, set
-      `closest_release` to true, and say in the assessment why the reported one could not be run. If the impact does
-      not appear there, test the main claim once on the latest release, in case the report names the wrong release,
-      and stop.
+   b. Reproduce it on the reported release, and put that release in `result_release`. The reported release is the
+      advisory's `reported_release`: install exactly that one first, whatever else the report mentions. Only if it is
+      empty, use the release the report says it tested, or the latest if it names none. Only if you tried and neither
+      the CLI nor the lab could run it, use the closest release instead: put that one in `result_release`, set
+      `closest_release` to true, and say in the assessment why the reported one could not be run. Use the report's
+      own files. If they run and the impact does not appear, make at most two changes the report's text supports (a
+      missing namespace, permission or setting), then record what you saw instead of building variants of your own,
+      test the main claim once on the latest release in case the report names the wrong release, and stop.
    c. While that release is still in use, test a further claim of the report (for example that the same flaw also
       allows writes) only if it would change the severity; otherwise reason from what you have shown. Say in the
       verdict which claims you ran and which you reasoned about.

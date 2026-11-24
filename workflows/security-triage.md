@@ -49,6 +49,10 @@ safe-outputs:
 # Each advisory reproduced in the lab takes about ten minutes: a fresh cluster and two installs.
 timeout-minutes: 90
 
+# The most AI credits one run may spend: about 200 per advisory, which a normal triage stays well under. A run that
+# reaches it stops; the verdict recorded so far still posts, and an advisory with none is marked unfinished.
+max-ai-credits: ${{ inputs.ghsa_id && '200' || '600' }}
+
 imports:
   - uses: kyverno/assistant/workflows/shared/security-triage.md@main
     with:

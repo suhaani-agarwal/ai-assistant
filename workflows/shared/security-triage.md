@@ -204,7 +204,9 @@ safe-outputs:
           type: string
           max-length: 4000
         evidence:
-          description: "Commands you ran and the relevant lines of their output. Excerpts only, no secrets."
+          description: >-
+            Commands you ran and the relevant lines of their output. Excerpts only, no secrets. Only what you ran and
+            saw: anything taken from the report without running it is marked "reported, not run".
           required: false
           type: string
           max-length: 5000
@@ -231,6 +233,13 @@ safe-outputs:
           with:
             name: security-triage-index
             path: /tmp/security-triage-index
+        # The lab's own record of the commands it ran, if the workflow has the lab and the agent used it.
+        - name: Download the lab command log
+          continue-on-error: true
+          uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+          with:
+            name: security-triage-lab-log
+            path: /tmp/security-triage-lab-log
         - name: Split the target repository
           id: target
           env:
@@ -257,6 +266,7 @@ safe-outputs:
             TEAM_MENTIONS: ${{ github.aw.import-inputs.team_mentions }}
             LIMIT: ${{ github.aw.import-inputs.limit }}
             INDEX_FILE: /tmp/security-triage-index/index.json
+            LAB_LOG: /tmp/security-triage-lab-log/commands.jsonl
             RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           run: |
             python3 - <<'PY'
@@ -324,7 +334,37 @@ safe-outputs:
             def related(v):
                 return [g for g in re.split(r"[,\s]+", str(v or "")) if GHSA.match(g)][:5]
 
-            def render(item, entry, team, run_url):
+            MAX_LAB_LINES = 60
+
+            def lab_section(commands):
+                """The lab commands recorded for this advisory by the lab tools themselves, not by the agent."""
+                if not commands:
+                    return []
+                shown = [f"[{c.get('release') or 'no release'}] exit {c.get('exit')}  {str(c.get('cmd'))[:220]}"
+                         for c in commands[:MAX_LAB_LINES]]
+                if len(commands) > MAX_LAB_LINES:
+                    shown.append(f"... and {len(commands) - MAX_LAB_LINES} more")
+                return ["", "#### Lab commands run",
+                        "Recorded by the lab as each command ran, not written by the agent.",
+                        "~~~text", clean("\n".join(shown), 15000), "~~~"]
+
+            def lab_commands(path):
+                """The lab's command log grouped by advisory; empty if the run had no lab or it ran nothing."""
+                by_ghsa = {}
+                try:
+                    with open(path) as f:
+                        for line in f:
+                            try:
+                                c = json.loads(line)
+                            except ValueError:
+                                continue
+                            if isinstance(c, dict) and GHSA.match(str(c.get("ghsa") or "")):
+                                by_ghsa.setdefault(c["ghsa"], []).append(c)
+                except OSError:
+                    pass
+                return by_ghsa
+
+            def render(item, entry, team, run_url, commands=None):
                 cls = item["classification"]
                 reported = entry.get("severity") or "not set"
                 reported_vec = entry.get("cvss_vector") or ""
@@ -361,6 +401,7 @@ safe-outputs:
                 ]
                 if item.get("evidence"):
                     lines += ["", "#### Evidence", "~~~text", clean(item["evidence"], 5000), "~~~"]
+                lines += lab_section(commands)
                 lines += ["", "#### Assessment", clean(item.get("assessment"), 3000)]
                 rel = related(item.get("related_advisories"))
                 if rel:
@@ -397,6 +438,7 @@ safe-outputs:
                 team = clean(os.environ.get("TEAM_MENTIONS", ""), 300).replace("@​", "@")
                 with open(os.environ["GH_AW_AGENT_OUTPUT"]) as f:
                     items = [i for i in json.load(f).get("items", []) if i.get("type") == "post_advisory_verdict"]
+                lab = lab_commands(os.environ.get("LAB_LOG", ""))
                 last = {}
                 for item in items:
                     item["reproduced"] = as_bool(item.get("reproduced"))
@@ -414,7 +456,8 @@ safe-outputs:
                     entry = index[item["ghsa_id"]]
                     first = not entry.get("comment_id")
                     changed = entry.get("previous_classification") != item["classification"]
-                    body = render(item, entry, team if (first or changed) else "", os.environ["RUN_URL"])
+                    body = render(item, entry, team if (first or changed) else "", os.environ["RUN_URL"],
+                                  lab.get(item["ghsa_id"]))
                     if staged:
                         summary += [f"## {item['ghsa_id']} (preview, not posted)", "", body, "", "---", ""]
                     else:
@@ -950,14 +993,16 @@ ${{ needs.collect.outputs.json }}
       can run that exact release, use the closest release you can run instead: put that one in `result_release`,
       set `closest_release` to true, and say in the assessment why the reported one could not be run.
    c. Check the same claim on a newer release before anything else: the newest patch of the same minor release if
-      you can install it (the report's policy runs there unchanged), then the latest release.
+      you can install it (the report's policy runs there unchanged). If it no longer appears there, that release is
+      `fixed_in`: stop checking newer releases for this claim and say in the verdict that later ones were not tested.
+      Only if it still appears, check the latest release too.
    d. Only then look at the report's further claims (for example that the same flaw also allows writes or
       privilege escalation). Build one only if it would change the severity; otherwise reason from what you have
       already shown, and say in the verdict which claims you ran and which you reasoned about.
 4. Compare with `published` for a possible duplicate.
-5. Write a CVSS 3.1 vector for what you observed on `result_release`, not from the report's wording. The
-   severity is computed from your vector, so choose each metric with care and explain the choices in the assessment.
-   Leave it empty when it is not a vulnerability.
+5. Write a CVSS 3.1 vector for what you observed on `result_release`, not from the report's wording: an impact you
+   did not observe yourself does not raise a metric. The severity is computed from your vector, so choose each metric
+   with care and explain the choices in the assessment. Leave it empty when it is not a vulnerability.
 6. Record what you have with `post_advisory_verdict` as soon as you have a result on the first release you test,
    then call it again with the full verdict once you have tested the other. The last call for an advisory replaces
    the earlier ones, so a later failure cannot lose a result you already have. Each call stands on its own: fill
@@ -975,6 +1020,10 @@ You are checking whether a claim holds, the way a test does. Write it like a tes
   names, messages or your notes.
 - If something you wrote is rejected or fails to compile on a release, say that you could not express the claim
   there and quote the error. Do not infer how the release behaves from an error message alone.
+- Evidence is only what you ran and saw. Anything you take from the report without running it, write as
+  "reported, not run", and leave it out of the CVSS vector. Never write that you verified something you did not run:
+  the comment also lists the commands the lab recorded, so a lab command in your evidence that is not in that list
+  shows.
 - Describe results as observations: "the canary value from kube-system appeared in the admission response to a user
   who cannot read kube-system", not as an attack story.
 

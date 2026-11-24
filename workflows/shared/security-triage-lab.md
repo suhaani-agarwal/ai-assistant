@@ -10,6 +10,9 @@
 # from the run's report manifests or the agent's scratch directory and nowhere else. The commands that would reach
 # the machine itself (cp, proxy, port-forward, config, plugin) are refused.
 #
+# Every lab command is logged by the tools themselves, outside the sandbox where the agent cannot write, and the
+# posting job lists those commands in the verdict comment, so the comment shows what really ran.
+#
 # Pods in the cluster can reach the internet, which pulls images and lets reports that need an outside listener be
 # tested. Before this runs on real reports from the private repository, decide whether to cut that egress once the
 # images are pulled.
@@ -36,10 +39,18 @@ steps:
       mkdir -p "$RUNNER_TEMP/security-triage-lab"
       cat > "$RUNNER_TEMP/security-triage-lab/lab.py" <<'PY'
       """The lab tools: create the cluster, install a release, run kubectl. Called by the mcp-scripts below."""
-      import json, os, re, shlex, subprocess, sys, tempfile
+      import json, os, re, secrets, shlex, subprocess, sys, tempfile
 
       LAB = os.path.join(os.environ.get("RUNNER_TEMP") or "/tmp", "security-triage-lab")
       KUBECONFIG = os.path.join(LAB, "kubeconfig")
+      # What ran, one JSON line per command, and which advisory and release it ran for. The tools run on the machine,
+      # outside the agent's sandbox, which cannot write here.
+      LOG = os.path.join(LAB, "commands.jsonl")
+      STATE = os.path.join(LAB, "state.json")
+      GHSA = re.compile(r"^GHSA(-[23456789cfghjmpqrvwx]{4}){3}$")
+      NAME = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
+      RULE_VERBS = {"get", "list", "watch", "create", "update", "patch", "delete", "deletecollection", "*"}
+      RESOURCE = re.compile(r"^([a-z0-9*][a-z0-9-]*)(/[a-z]+)?(\.[a-z0-9][a-z0-9.-]*)?$")
       CLUSTER = "lab"
       MAX_OUT = 20000
       VERSION = re.compile(r"^v?\d+\.\d+\.\d+(-(alpha|beta|rc)\.\d+)?$")
@@ -71,6 +82,28 @@ steps:
               text = "[... cut ...]\n" + text[-MAX_OUT:]
           print(f"exit {code}\n{text}")
           return code
+
+      def state():
+          try:
+              with open(STATE) as f:
+                  return json.load(f)
+          except (OSError, ValueError):
+              return {}
+
+      def set_state(**kw):
+          s = dict(state(), **kw)
+          with open(STATE, "w") as f:
+              json.dump(s, f)
+
+      def log(command, code):
+          s = state()
+          try:
+              with open(LOG, "a") as f:
+                  f.write(json.dumps({"ghsa": s.get("ghsa", ""), "release": s.get("release", ""), "cmd": command,
+                                      "exit": code}) + "\n")
+          except OSError as e:
+              # The command already ran; say so rather than lose its output.
+              print(f"(not recorded in the lab log: {e})")
 
       def run(cmd, stdin=None, timeout=300):
           try:
@@ -161,10 +194,14 @@ steps:
           if code == 0:
               code, nodes = run(["kubectl", "get", "nodes", "-o", "wide"])
               text += "\n" + nodes
+          set_state(release="")
+          log("lab-reset" + (f" {k8s_version}" if k8s_version else ""), code)
           return out(code, text)
 
-      def install(version, values=""):
-          version = (version or "").strip()
+      def install(version, values="", ghsa_id=""):
+          version, ghsa_id = (version or "").strip(), (ghsa_id or "").strip()
+          if not GHSA.match(ghsa_id):
+              return out(2, "ghsa_id must be the GHSA ID of the advisory you are testing")
           if version != "latest" and not VERSION.match(version) and not MINOR.match(version):
               return out(2, "version must be `latest`, a release such as v1.16.1, or a minor such as v1.16 for its newest patch")
           if len(values or "") > 20000:
@@ -188,7 +225,81 @@ steps:
           code, text = run(cmd, timeout=600)
           _, pods = run(["kubectl", "get", "pods", "-n", ns, "-o", "wide"])
           app = next((e.get("app_version") for e in entries if e.get("version") == cv), "")
+          set_state(ghsa=ghsa_id, release=app if code == 0 else "")
+          log(f"lab-install {version} (chart {cv}, release {app})" + (" with Helm values" if values else ""), code)
           return out(code, f"chart {chart} {cv} (release {app})\n{text}\n{pods}")
+
+      def parse_rules(text):
+          """Role rules from `verbs:resources; ...`, e.g. `create,get:configmaps,policies.kyverno.io`."""
+          rules = []
+          for part in [p.strip() for p in (text or "").split(";") if p.strip()]:
+              if ":" not in part:
+                  raise ValueError(f"{part!r}: write each rule as verbs:resources")
+              verbs_text, resources_text = part.split(":", 1)
+              verbs = [v.strip() for v in verbs_text.split(",") if v.strip()]
+              if not verbs or not set(verbs) <= RULE_VERBS:
+                  raise ValueError(f"{part!r}: verbs must be from {', '.join(sorted(RULE_VERBS))}")
+              by_group = {}
+              for r in [r.strip() for r in resources_text.split(",") if r.strip()]:
+                  if not RESOURCE.match(r):
+                      raise ValueError(f"{r!r} is not a resource, e.g. configmaps or policies.kyverno.io")
+                  name, _, group = r.partition(".")
+                  by_group.setdefault(group, []).append(name)
+              if not by_group:
+                  raise ValueError(f"{part!r}: name at least one resource")
+              rules += [{"apiGroups": [g], "resources": names, "verbs": verbs} for g, names in by_group.items()]
+          if not rules:
+              raise ValueError("give at least one rule")
+          return rules
+
+      def tenant(namespace="", rules="", other_namespace="", user=""):
+          """The usual setup for a report about a namespaced user: that user with only the given permissions in its
+          namespace, a second namespace holding canary values, and what the user can and cannot do."""
+          ns, other, user = namespace or "probe-tenant", other_namespace or "probe-other", user or "probe-user"
+          try:
+              for n in (ns, other, user):
+                  if not NAME.match(n):
+                      raise ValueError(f"{n!r} is not a valid Kubernetes name")
+              if ns == other:
+                  raise ValueError("the other namespace must differ from the user's")
+              parsed = parse_rules(rules)
+          except ValueError as e:
+              return out(2, str(e))
+          canary = "canary-" + secrets.token_hex(4)
+          objects = [
+              {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": ns}},
+              {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": other}},
+              {"apiVersion": "v1", "kind": "ServiceAccount", "metadata": {"name": user, "namespace": ns}},
+              {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role",
+               "metadata": {"name": f"{user}-role", "namespace": ns}, "rules": parsed},
+              {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+               "metadata": {"name": f"{user}-binding", "namespace": ns},
+               "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": f"{user}-role"},
+               "subjects": [{"kind": "ServiceAccount", "name": user, "namespace": ns}]},
+              {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "probe-canary", "namespace": other},
+               "data": {"value": canary}},
+              {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "probe-canary", "namespace": other},
+               "stringData": {"value": canary}},
+          ]
+          code, applied = run(["kubectl", "--request-timeout=90s", "apply", "-f", "-"],
+                              stdin=json.dumps({"apiVersion": "v1", "kind": "List", "items": objects}), timeout=150)
+          log(f"lab-tenant namespace={ns} other_namespace={other} user={user} rules={rules.strip()}", code)
+          if code:
+              return out(code, applied)
+          as_user = f"system:serviceaccount:{ns}:{user}"
+          checks = [(v, r, ns) for rule in parsed for v in rule["verbs"] if v != "*"
+                    for r in [f"{n}.{rule['apiGroups'][0]}" if rule["apiGroups"][0] else n for n in rule["resources"]]][:20]
+          checks += [("get", "configmaps", other), ("get", "secrets", other), ("list", "secrets", "")]
+          lines = []
+          for verb, resource, where in checks:
+              scope = ["-n", where] if where else ["--all-namespaces"]
+              _, answer = run(["kubectl", "auth", "can-i", verb, resource, *scope, f"--as={as_user}"], timeout=60)
+              lines.append(f"  {answer.strip().splitlines()[0] if answer.strip() else '?':4} {verb} {resource} "
+                           + (f"-n {where}" if where else "--all-namespaces"))
+          return out(0, f"act as this user with: --as={as_user}\n"
+                        f"canary value: {canary}, in ConfigMap {other}/probe-canary and Secret {other}/probe-canary "
+                        "(key `value`)\n"
+                        "what the user can do (kubectl auth can-i):\n" + "\n".join(lines) + "\n\n" + applied)
 
       def kubectl(args, stdin="", file=""):
           try:
@@ -209,6 +320,7 @@ steps:
                   return out(2, f"stdin does not end with the line `{END_MARKER}`, so it was probably cut off before "
                                 "the end. Nothing was applied. Send the whole manifest again, ending with that line.")
           code, text = run(["kubectl", "--request-timeout=90s", *tokens], stdin=stdin or None, timeout=150)
+          log("kubectl " + shlex.join(tokens) + (f" < {os.path.basename(file)}" if file else " < stdin" if stdin else ""), code)
           return out(code, text)
 
       def main(argv):
@@ -217,7 +329,10 @@ steps:
           if cmd == "create":
               return create(env("INPUT_K8S_VERSION", ""))
           if cmd == "install":
-              return install(env("INPUT_VERSION", ""), env("INPUT_VALUES", ""))
+              return install(env("INPUT_VERSION", ""), env("INPUT_VALUES", ""), env("INPUT_GHSA_ID", ""))
+          if cmd == "tenant":
+              return tenant(env("INPUT_NAMESPACE", ""), env("INPUT_RULES", ""), env("INPUT_OTHER_NAMESPACE", ""),
+                            env("INPUT_USER", ""))
           if cmd == "kubectl":
               return kubectl(env("INPUT_ARGS", ""), env("INPUT_STDIN", ""), env("INPUT_FILE", ""))
           return out(2, f"unknown command {cmd!r}")
@@ -229,6 +344,17 @@ steps:
       helm repo add lab "$HELM_REPO" >/dev/null
       helm repo update lab >/dev/null
       python3 -I "$RUNNER_TEMP/security-triage-lab/lab.py" create
+
+# After the agent: keep the command log for the posting job, which lists it in the verdict comment.
+post-steps:
+  - name: Keep the lab command log
+    if: always()
+    uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+    with:
+      name: security-triage-lab-log
+      path: ${{ runner.temp }}/security-triage-lab/commands.jsonl
+      retention-days: 1
+      if-no-files-found: ignore
 
 mcp-scripts:
   lab-reset:
@@ -247,6 +373,10 @@ mcp-scripts:
       Install a release of the project into the lab cluster with Helm, replacing any release already there, and
       wait until it is ready (a few minutes). Returns Helm's output and the project's pods.
     inputs:
+      ghsa_id:
+        type: string
+        required: true
+        description: "The GHSA ID of the advisory you are testing. The lab records which advisory each command was for."
       version:
         type: string
         required: true
@@ -260,6 +390,33 @@ mcp-scripts:
       LAB_CHART: lab/${{ github.aw.import-inputs.chart_name }}
       LAB_NAMESPACE: ${{ github.aw.import-inputs.release_namespace }}
     timeout: 660
+  lab-tenant:
+    description: >-
+      The usual setup for a report about a namespaced user, in one call: a service account with only the permissions
+      you give, in its own namespace, plus a second namespace holding a canary value in a ConfigMap and a Secret.
+      Returns the --as value, the canary value and `auth can-i` results showing what the user can and cannot do.
+      Run it again after each lab-reset.
+    inputs:
+      rules:
+        type: string
+        required: true
+        description: >-
+          The user's permissions in its namespace, as verbs:resources separated by `;`, e.g.
+          `create,get,list,update,delete:policies.kyverno.io,configmaps`. Give exactly what the report says the user has.
+      namespace:
+        type: string
+        required: false
+        description: "The user's namespace. Default probe-tenant."
+      other_namespace:
+        type: string
+        required: false
+        description: "The namespace the user should not reach, which holds the canary. Default probe-other."
+      user:
+        type: string
+        required: false
+        description: "The service account name. Default probe-user."
+    run: python3 -I "$RUNNER_TEMP/security-triage-lab/lab.py" tenant
+    timeout: 180
   lab-kubectl:
     description: >-
       Run one kubectl command against the lab cluster, e.g. `apply -f -` with the manifest in stdin, `get pods -A`,
@@ -294,9 +451,12 @@ controller crashing. Use the CLI for what the CLI can show on its own.
 
 - `lab-reset` gives you a fresh empty cluster. It already ran once before you started, so the cluster exists, but
   nothing is installed in it yet.
-- `lab-install` installs a release with Helm: a version such as `v1.16.1`, a minor such as `v1.16` for its newest
+- `lab-install` installs a release with Helm, for the advisory you name in `ghsa_id`: a version such as `v1.16.1`, a minor such as `v1.16` for its newest
   patch, or `latest`. Its output names the release it installed. Pass Helm values when the report needs a non-default
   setting, and say in your verdict which ones you set and why.
+- `lab-tenant` does the usual setup for a report about a namespaced user in one call: the user with exactly the
+  permissions you give, a second namespace with a canary value, and `auth can-i` results showing the user cannot
+  already reach it. Use it instead of building these by hand, and again after each `lab-reset`.
 - `lab-kubectl` runs one kubectl command. For a manifest from the report, use `-f -` with `file` set to its listed
   path, and do not retype it. The same works for a file you wrote in your scratch directory, so you can apply it
   again on the next release without sending it twice. Otherwise put the manifest in `stdin` with `-f -`, and end
@@ -307,20 +467,25 @@ controller crashing. Use the CLI for what the CLI can show on its own.
 
 How to use it:
 
-1. Build only what the report needs: a `probe-*` service account with exactly the permissions the report says the
-   user has, a separate namespace for anything that user should not reach, and a canary value of your own (for
-   example a Secret or ConfigMap holding `canary-<random>`) so that "the value appeared" or "it changed" is
-   something you can see, not something you infer. Check the account's limits with `auth can-i` first.
+1. Build only what the report needs. For a report about a namespaced user, call `lab-tenant` with exactly the
+   permissions the report says the user has: it creates the user, a namespace it should not reach and a canary value
+   there, so that "the value appeared" or "it changed" is something you can see, not something you infer. Read its
+   `auth can-i` results: if the user can already reach the other namespace, the report's claim proves nothing. Add
+   anything else the report needs with `lab-kubectl`.
 2. Install the version the report names, follow the report's steps for its main claim as that account, and record
    what you observe: denials, the canary showing up where it should not, a resource changed, a controller
    restarting (`get pods -n <namespace>` restart counts and `logs --previous`). Record the verdict so far.
 3. Then `lab-reset`, install the newest patch of the same minor release (for a report on v1.16.1, install `v1.16`),
    and repeat the same claim with the same policy. Fixes usually ship as patches, so this shows whether the claim is
    fixed, and the report's policy runs there unchanged.
-4. Then `lab-reset`, install `latest`, and repeat the same claim, so you can say whether it still happens today. If
-   the latest release no longer accepts the report's policy, follow this project's rules for the replacement.
+4. Only if the claim still appears on that patch: `lab-reset`, install `latest`, and repeat it, so you can say
+   whether it still happens today. If the latest release no longer accepts the report's policy, follow this
+   project's rules for the replacement. If the patch no longer shows it, that patch is `fixed_in`: do not install
+   `latest` or write a replacement policy, and say in the verdict that later releases were not tested.
 5. Do steps 3 and 4 before trying any further claim from the report. `lab-reset` before moving to the next
    advisory.
+
+The lab records every command it runs, and the verdict comment lists them. Your evidence must match that list.
 
 If a report needs something the lab cannot provide (a cloud provider, several nodes, an unreleased build, the
 public internet), say exactly what was missing in your verdict and call `report_missing_tool` naming it, then

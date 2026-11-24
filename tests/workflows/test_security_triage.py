@@ -331,9 +331,36 @@ class Post(unittest.TestCase):
         self.assertEqual(len(calls), 3)
 
 
+    def test_the_lab_commands_recorded_for_the_advisory_are_listed_and_cannot_inject(self):
+        cmds = [{"ghsa": GHSA, "release": "v1.16.1", "cmd": "kubectl apply -f - < 01-Policy-x.yaml", "exit": 0},
+                {"ghsa": GHSA, "release": "v1.16.1", "cmd": "kubectl get cm @octocat ~~~ <!-- x -->", "exit": 1}]
+        body = self.s["render"](verdict(), self.index[GHSA], "", "https://run", cmds)
+        self.assertIn("#### Lab commands run", body)
+        self.assertIn("[v1.16.1] exit 0  kubectl apply -f - < 01-Policy-x.yaml", body)
+        self.assertNotIn("@octocat", body)
+        self.assertNotIn("<!-- x", body)
+        self.assertIn("kubectl get cm @\u200bocto", body)
+        self.assertNotIn(" ~~~ ", body)  # a fence inside a command cannot close the block early
+        self.assertNotIn("Lab commands", self.s["render"](verdict(), self.index[GHSA], "", "https://run", []))
+
+    def test_the_lab_log_is_grouped_by_advisory_and_junk_lines_are_dropped(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+            f.write(json.dumps({"ghsa": GHSA, "release": "v1.16.1", "cmd": "a", "exit": 0}) + "\n")
+            f.write("not json\n" + json.dumps({"ghsa": "", "cmd": "before any install", "exit": 0}) + "\n")
+            f.write(json.dumps({"ghsa": OTHER, "release": "v1.20.0", "cmd": "b", "exit": 0}) + "\n")
+        try:
+            by = self.s["lab_commands"](f.name)
+        finally:
+            os.unlink(f.name)
+        self.assertEqual({g: [c["cmd"] for c in v] for g, v in by.items()}, {GHSA: ["a"], OTHER: ["b"]})
+        self.assertEqual(self.s["lab_commands"]("/nonexistent/commands.jsonl"), {})
+
 class Lab(unittest.TestCase):
     def setUp(self):
         self.s = script("def check_kubectl(", LAB)
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d, ignore_errors=True))
+        self.s.update(LOG=os.path.join(d, "commands.jsonl"), STATE=os.path.join(d, "state.json"))
 
     def test_cluster_commands_with_stdin_manifests_and_impersonation_are_allowed(self):
         ok = self.s["check_kubectl"]
@@ -419,6 +446,60 @@ if __name__ == "__main__":
             self.assertEqual(kubectl("get pods", file=f"{GHSA}/01-Pod-probe.yaml"), 2)
             self.assertEqual(kubectl("apply -f -", "kind: Pod\n# end\n", file=f"{GHSA}/01-Pod-probe.yaml"), 2)
         self.assertEqual(inputs, ["kind: Pod\n", "kind: Role\n"])
+
+    def test_tenant_rules_become_role_rules_and_bad_input_is_refused(self):
+        rules = self.s["parse_rules"]("create,get:policies.kyverno.io,configmaps; get:pods/log")
+        self.assertEqual(rules, [{"apiGroups": ["kyverno.io"], "resources": ["policies"], "verbs": ["create", "get"]},
+                                 {"apiGroups": [""], "resources": ["configmaps"], "verbs": ["create", "get"]},
+                                 {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]}])
+        for bad in ("", "get", "escalate:roles", "get:Pods", "get:$(id)", "get:"):
+            with self.assertRaises(ValueError, msg=bad):
+                self.s["parse_rules"](bad)
+
+    def test_tenant_builds_the_user_and_canary_and_reports_what_it_can_do(self):
+        calls = []
+        def fake(cmd, **kw):
+            calls.append((cmd, kw.get("input")))
+            return subprocess.CompletedProcess(cmd, 0, "no\n" if "can-i" in cmd else "applied\n", "")
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.dict(self.s, {"LOG": os.path.join(d, "log"), "STATE": os.path.join(d, "state")}), \
+             mock.patch.object(self.s["subprocess"], "run", fake), mock.patch("sys.stdout") as stdout:
+            self.assertEqual(self.s["tenant"](rules="create:configmaps"), 0)
+            self.assertEqual(self.s["tenant"]("Bad_NS", "get:pods"), 2)
+            self.assertEqual(self.s["tenant"]("same", "get:pods", "same"), 2)
+            printed = "".join(c.args[0] for c in stdout.write.call_args_list)
+        items = json.loads(calls[0][1])["items"]
+        self.assertEqual([i["kind"] for i in items],
+                         ["Namespace", "Namespace", "ServiceAccount", "Role", "RoleBinding", "ConfigMap", "Secret"])
+        canary = items[5]["data"]["value"]
+        self.assertTrue(canary.startswith("canary-"))
+        self.assertEqual(items[6]["stringData"]["value"], canary)
+        self.assertIn("--as=system:serviceaccount:probe-tenant:probe-user", printed)
+        self.assertIn("no   get secrets -n probe-other", printed)
+        can_i = [c[0] for c in calls if "can-i" in c[0]]
+        self.assertIn(["kubectl", "auth", "can-i", "create", "configmaps", "-n", "probe-tenant",
+                       "--as=system:serviceaccount:probe-tenant:probe-user"], can_i)
+
+    def test_each_command_is_logged_with_the_advisory_and_release_of_the_last_install(self):
+        def fake(cmd, **kw):
+            out = json.dumps([{"version": "3.6.1", "app_version": "v1.16.1"}]) if "search" in cmd else ""
+            return subprocess.CompletedProcess(cmd, 0, out, "")
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.dict(self.s, {"LOG": os.path.join(d, "log"), "STATE": os.path.join(d, "state"), "LAB": d}), \
+             mock.patch.dict(os.environ, {"LAB_CHART": "lab/kyverno", "LAB_NAMESPACE": "kyverno"}), \
+             mock.patch.object(self.s["subprocess"], "run", fake), mock.patch("sys.stdout"):
+            self.assertEqual(self.s["install"]("v1.16.1", ""), 2)  # no advisory named
+            self.s["install"]("v1.16.1", "", GHSA)
+            self.s["kubectl"]("apply -f -", "kind: Pod\n# end\n")
+            self.s["create"]()
+            self.s["kubectl"]("get pods -A")
+            log = [json.loads(l) for l in pathlib.Path(d, "log").read_text().splitlines()]
+        self.assertEqual([(l["ghsa"], l["release"], l["cmd"]) for l in log], [
+            (GHSA, "v1.16.1", "lab-install v1.16.1 (chart 3.6.1, release v1.16.1)"),
+            (GHSA, "v1.16.1", "kubectl apply -f - < stdin"),
+            (GHSA, "", "lab-reset"),
+            (GHSA, "", "kubectl get pods -A"),
+        ])
 
 class Unfinished(unittest.TestCase):
     def setUp(self):

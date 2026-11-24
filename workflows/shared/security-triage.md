@@ -32,8 +32,9 @@ import-schema:
   limit:
     type: integer
     default: 3
-  # The project's CLI, installed outside the sandbox for the agent: the latest release as `<cli_binary>-latest` and the
-  # newest patch of the previous minor as `<cli_binary>-previous`. `{tag}` in the asset name is replaced by the tag.
+  # The project's CLI, installed outside the sandbox for the agent: the latest release as `<cli_binary>-latest`, the
+  # newest patch of the previous minor as `<cli_binary>-previous`, and the advisory's reported release as
+  # `<cli_binary>-reported`. `{tag}` in the asset name is replaced by the tag.
   cli_repo:
     type: string
     default: "kyverno/kyverno"
@@ -64,6 +65,7 @@ tools:
   bash:
     - "${{ github.aw.import-inputs.cli_binary }}-latest:*"
     - "${{ github.aw.import-inputs.cli_binary }}-previous:*"
+    - "${{ github.aw.import-inputs.cli_binary }}-reported:*"
     - "cat"
     - "ls"
     - "head"
@@ -126,10 +128,7 @@ steps:
       latest = tags[0]
       previous = next((t for t in tags if ver(t)[:2] < ver(latest)[:2]), None)
 
-      installed = {}
-      for name, tag in (("latest", latest), ("previous", previous)):
-          if not tag:
-              continue
+      def install(tag, name):
           asset = asset_tpl.replace("{tag}", tag)
           with tempfile.TemporaryDirectory() as d:
               subprocess.run(["gh", "release", "download", tag, "-R", repo, "-p", asset, "-D", d], check=True)
@@ -139,7 +138,25 @@ steps:
                   tf.extract(member, d, filter="data")
               target = f"/usr/local/bin/{binary}-{name}"
               subprocess.run(["sudo", "install", "-m", "0755", os.path.join(d, binary), target], check=True)
-          installed[f"{binary}-{name}"] = tag
+
+      installed = {}
+      for name, tag in (("latest", latest), ("previous", previous)):
+          if tag:
+              install(tag, name)
+              installed[f"{binary}-{name}"] = tag
+
+      # The reported release, so a report that needs only the CLI is tested on the release it names. Collect worked
+      # it out from the advisory's version range; with one advisory per run there is one. An older release whose
+      # asset is missing or named differently is skipped, and the agent falls back to the closest release it can run.
+      with open(f"{base}/input/advisories.json") as f:
+          reported = {a.get("reported_release") for a in json.load(f)["advisories"]} - {None}
+      if len(reported) == 1:
+          tag = reported.pop()
+          try:
+              install(tag, "reported")
+              installed[f"{binary}-reported"] = tag
+          except (subprocess.CalledProcessError, StopIteration, OSError, tarfile.TarError) as e:
+              print(f"::warning::Could not install the CLI for the reported release {tag}: {e}")
       with open(f"{base}/versions.json", "w") as f:
           json.dump(installed, f, indent=2)
       print("Installed:", installed)
@@ -588,12 +605,14 @@ jobs:
               return max(found)[1] if found else None
 
           def releases_of(repo):
-              """Published, non-prerelease release tags of the project, newest first; empty if they cannot be read."""
+              """Published, non-prerelease release tags of the project. Stops the run if they cannot be read: without
+              them every reported release would be empty and the agent would fall back to guessing one, so it is better
+              to triage nothing and let the next run try again."""
               r = subprocess.run(["gh", "api", "--paginate", "--slurp", f"repos/{repo}/releases?per_page=100"],
                                  capture_output=True, text=True, env=dict(os.environ, GH_TOKEN=os.environ["RELEASES_TOKEN"]))
               if r.returncode:
-                  print(f"::warning::Could not list the releases of {repo}; reported releases are left empty")
-                  return []
+                  raise SystemExit(f"::error::Could not list the releases of {repo} (exit {r.returncode}); "
+                                   "nothing is triaged this run")
               return [x["tag_name"] for page in json.loads(r.stdout or "[]") for x in page
                       if not x.get("draft") and not x.get("prerelease")]
           # The Kubernetes manifests in a report are copied into files, exactly as written, so the agent applies them
@@ -1031,9 +1050,10 @@ answer your questions.
 
 ## What you have
 
-- The project's CLI, two releases: `${{ github.aw.import-inputs.cli_binary }}-latest` and
-  `${{ github.aw.import-inputs.cli_binary }}-previous`. `/tmp/gh-aw/security-triage/versions.json` says which tag
-  each one is. Run `--help` on a subcommand before relying on its flags.
+- The project's CLI: `${{ github.aw.import-inputs.cli_binary }}-latest`, `${{ github.aw.import-inputs.cli_binary }}-previous`,
+  and `${{ github.aw.import-inputs.cli_binary }}-reported` for the advisory's `reported_release` when it could be
+  installed. `/tmp/gh-aw/security-triage/versions.json` says which tag each one is. Run `--help` on a subcommand
+  before relying on its flags.
 - Context documents in `/tmp/gh-aw/security-triage/context/`: the project's threat model and security guidance,
   and any reference documents the project adds. Read the threat model once, before the first advisory: it says what
   the project treats as the operator's responsibility. Search the reference documents with `grep` when you need them.

@@ -137,6 +137,14 @@ class Collect(unittest.TestCase):
             self.assertIsNone(self.rel(bad), bad)
         self.assertIsNone(self.s["reported_release"](None, self.RELEASES))
 
+    def test_an_unreadable_release_list_stops_the_run_instead_of_guessing(self):
+        failed = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "rate limit")
+        with mock.patch.object(self.s["subprocess"], "run", failed), \
+             mock.patch.dict(os.environ, {"RELEASES_TOKEN": "t"}):
+            with self.assertRaises(SystemExit) as e:
+                self.s["releases_of"]("kyverno/kyverno")
+        self.assertIn("nothing is triaged", str(e.exception))
+
     def test_the_picked_advisory_carries_its_reported_release(self):
         adv = advisory(vulnerabilities=[{"package": {"ecosystem": "go", "name": "github.com/kyverno/kyverno"},
                                          "vulnerable_version_range": "<= 1.18.1"}])
@@ -775,6 +783,11 @@ class Prompt(unittest.TestCase):
         self.assertIn("advisory's `reported_release`: install exactly that one first", self.step3)
         self.assertIs(self.shared_front["tools"]["github"], False)
         self.assertIn("at most two changes the report's text supports", self.step3)
+
+    def test_the_reported_release_has_a_cli_of_its_own(self):
+        self.assertIn("${{ github.aw.import-inputs.cli_binary }}-reported:*", self.shared_front["tools"]["bash"])
+        self.assertIn("-reported` for the advisory's `reported_release`", self.shared)
+        self.assertIn('install(tag, "reported")', SHARED.read_text())
 
     def test_the_verdict_may_be_recorded_early_and_again(self):
         self.assertNotIn("one `post_advisory_verdict` call", self.shared)

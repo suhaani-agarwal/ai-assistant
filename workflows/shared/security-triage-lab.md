@@ -519,7 +519,8 @@ controller crashing. Use the CLI for what the CLI can show on its own.
 - `lab-reset` gives you a fresh empty cluster. It already ran once before you started, so the cluster exists, but
   nothing is installed in it yet.
 - `lab-install` installs a release with Helm, for the advisory you name in `ghsa_id`: a release such as `v1.16.1`, a
-  minor such as `v1.16` for its newest patch, or `latest`. Its output names the release it installed. Pass Helm values
+  minor such as `v1.16` for its newest patch, or `latest`. It can install any published release, including ones the
+  CLI does not have, and says so if no chart ships the one you asked for. Its output names the release it installed. Pass Helm values
   when the report needs a non-default setting, and say in your verdict which ones you set and why.
 - `lab-tenant` sets up a namespaced user and a canary value in a namespace it should not reach, in one call.
 - `lab-kubectl` runs one kubectl command. For a manifest from the report, use `-f -` with `file` set to its listed

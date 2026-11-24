@@ -987,8 +987,8 @@ ${{ needs.collect.outputs.json }}
    where it gives them, unchanged wherever they run, adapted only as far as needed. Keep notes of each command, its
    exit code and the lines of output that matter. This is the order of releases to test; nothing else adds one:
    a. Pick the report's main claim: the one impact the rest depends on.
-   b. Reproduce it on the reported release, and put that release in `result_release`. If neither the CLI nor the lab
-      can run it, use the closest release you can run instead: put that one in `result_release`, set
+   b. Reproduce it on the reported release, and put that release in `result_release`. Only if you tried and neither
+      the CLI nor the lab could run it, use the closest release you can run instead: put that one in `result_release`, set
       `closest_release` to true, and say in the assessment why the reported one could not be run. If the impact does
       not appear there, test the main claim once on the latest release, in case the report names the wrong release,
       and stop.

@@ -729,6 +729,10 @@ class Prompt(unittest.TestCase):
         self.assertNotIn("between advisories", self.tools)
         self.assertEqual(len(re.findall(r"--as\b", self.lab)), 0, "the tool descriptions explain --as")
 
+    def test_the_closest_release_is_a_fallback_after_trying_and_the_lab_installs_any_release(self):
+        self.assertIn("Only if you tried and neither", self.step3)
+        self.assertIn("any published release, including ones the\n  CLI does not have", self.lab)
+
     def test_the_verdict_may_be_recorded_early_and_again(self):
         self.assertNotIn("one `post_advisory_verdict` call", self.shared)
         self.assertIn("call it again with the full verdict", self.shared)

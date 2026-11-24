@@ -477,6 +477,23 @@ class Lab(unittest.TestCase):
         self.assertIn(["kubectl", "auth", "can-i", "create", "configmaps", "-n", "probe-tenant",
                        "--as=system:serviceaccount:probe-tenant:probe-user"], can_i)
 
+    def test_tenant_uses_the_reports_own_names_so_its_manifests_apply_unchanged(self):
+        calls = []
+        def fake(cmd, **kw):
+            calls.append(kw.get("input"))
+            return subprocess.CompletedProcess(cmd, 0, "yes\n" if "can-i" in cmd else "applied\n", "")
+        with mock.patch.object(self.s["subprocess"], "run", fake), mock.patch("sys.stdout") as stdout:
+            self.assertEqual(self.s["tenant"]("default", "create:configmaps", "kube-system", "probe-policy-admin",
+                                              "target-cm", "key"), 0)
+            self.assertEqual(self.s["tenant"]("default", "get:pods", "kube-system", "u", "target-cm", "bad key"), 2)
+            printed = "".join(c.args[0] for c in stdout.write.call_args_list)
+        items = json.loads(calls[0])["items"]
+        cm, secret = items[5], items[6]
+        self.assertEqual((cm["metadata"], list(cm["data"])), ({"name": "target-cm", "namespace": "kube-system"}, ["key"]))
+        self.assertEqual(list(secret["stringData"]), ["key"])
+        self.assertEqual(items[2]["metadata"], {"name": "probe-policy-admin", "namespace": "default"})
+        self.assertIn("under key `key` in ConfigMap kube-system/target-cm", printed)
+
     def test_inline_values_are_kept_out_of_the_log(self):
         r = lambda a: " ".join(self.s["redact"](a.split()))
         self.assertEqual(r("create secret generic s --from-literal=token=abc123 -n t"),
@@ -599,6 +616,93 @@ class Unfinished(unittest.TestCase):
             self.run_main({"items": []}, fail_on=(GHSA,))
         self.assertIn(GHSA, str(e.exception))
         self.assertNotIn(OTHER, str(e.exception))
+
+
+def split_component(path: pathlib.Path):
+    """(frontmatter as data, prompt body) of a gh-aw component."""
+    import yaml
+    text = path.read_text()
+    assert text.startswith("---\n"), path
+    front, body = text[4:].split("\n---\n", 1)
+    return yaml.safe_load(front), body
+
+
+def descriptions(node):
+    """Every `description` string in a frontmatter tree: what the agent reads about tools and fields."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "description" and isinstance(v, str):
+                yield v
+            else:
+                yield from descriptions(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from descriptions(v)
+
+
+class Prompt(unittest.TestCase):
+    """The instructions the agent gets, read as a whole: each rule has one home and nothing contradicts it."""
+
+    def setUp(self):
+        self.shared_front, self.shared = split_component(SHARED)
+        self.lab_front, self.lab = split_component(LAB)
+        project, _ = split_component(ROOT / "workflows" / "security-triage.md")
+        self.rules = next(i["with"]["extra_rules"] for i in project["imports"] if "extra_rules" in i.get("with", {}))
+        self.tools = "\n".join(descriptions(self.lab_front.get("mcp-scripts")))
+        self.fields = "\n".join(descriptions(self.shared_front["safe-outputs"]))
+        step3 = re.search(r"\n3\. Reproduce it.*?\n4\. ", self.shared, re.S)
+        self.assertIsNotNone(step3, "step 3 of the advisory steps not found")
+        self.step3 = step3.group(0)
+        self.everything_but_step3 = "\n".join([self.shared.replace(self.step3, "\n4. "), self.lab, self.rules,
+                                               self.tools, self.fields])
+
+    # The only other places that may say "latest": the CLI binary's name, the version syntax of lab-install, and the
+    # project rule that applies once step 3 has chosen to test the latest release.
+    LATEST_ALLOWED = ("-latest`", "for its newest patch, or `latest`", "`latest`, the application release to install",
+                      "When you test the latest release")
+
+    def test_only_step_3_says_which_releases_to_test(self):
+        for line in self.everything_but_step3.splitlines():
+            rest = line
+            for allowed in self.LATEST_ALLOWED:
+                rest = rest.replace(allowed, "")
+            if re.search(r"\blatest\b", rest):
+                self.fail(f"names the latest release outside step 3: {line.strip()!r}")
+            for phrase in ("newest patch of the same minor", "before trying any further claim", "Only then look at",
+                           "fixed_in`: stop"):
+                self.assertNotIn(phrase, line, "the testing order belongs to step 3 only")
+
+    def test_step_3_has_the_whole_order_once(self):
+        for phrase in ("on the reported release", "While that release is still in use", "newest patch of the same minor",
+                       "that release is `fixed_in`", "is not a fix", "test the main claim on the latest"):
+            self.assertEqual(self.step3.count(phrase), 1, phrase)
+
+    def test_the_project_rules_only_apply_when_latest_is_tested(self):
+        for sentence in re.split(r"(?<=\.)\s+", self.rules):
+            if "latest" in sentence:
+                self.assertTrue(sentence.startswith("When you test the latest release"), sentence)
+
+    def test_nothing_tells_the_agent_to_build_the_tenant_user_by_hand(self):
+        for text in (self.lab, self.tools):
+            self.assertNotIn("RoleBinding", text.replace("Role and RoleBinding names fit", ""))
+            self.assertNotIn("after creating that service account", text)
+
+    def test_reset_timing_and_impersonation_are_each_said_once(self):
+        lab_and_tools = self.lab + "\n" + self.tools
+        self.assertEqual(lab_and_tools.count("before the next release"), 1)
+        self.assertNotIn("after each `lab-reset`", lab_and_tools)
+        self.assertNotIn("between advisories", self.tools)
+        self.assertEqual(len(re.findall(r"--as\b", self.lab)), 0, "the tool descriptions explain --as")
+
+    def test_report_input_may_be_run_in_the_lab_and_report_files_keep_their_names(self):
+        self.assertIn("CLI or,\nif there is one, the lab", self.shared)
+        self.assertNotIn("inside your scratch directory. Your only output", self.shared)
+        self.assertIn("never rewrite one only to rename it", self.shared)
+
+    def test_lab_tenant_takes_the_reports_own_names(self):
+        inputs = self.lab_front["mcp-scripts"]["lab-tenant"]["inputs"]
+        for field in ("namespace", "other_namespace", "user", "canary_name", "canary_key"):
+            self.assertIn("the report", inputs[field]["description"], field)
 
 
 if __name__ == "__main__":

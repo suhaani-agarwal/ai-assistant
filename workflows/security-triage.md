@@ -74,11 +74,11 @@ imports:
         PolicyExceptions or Kyverno's ConfigMap already assumes cluster-admin-equivalent power unless the report
         shows a namespaced user doing it. Policies with failurePolicy Ignore, excluded namespaces or excluded groups
         behave as configured. Kyverno v1.20 and later reject the legacy kyverno.io policy types (ClusterPolicy,
-        Policy). If the latest CLI refuses the report's policy for that reason, write the equivalent
-        policies.kyverno.io policy (ValidatingPolicy, MutatingPolicy or GeneratingPolicy, or their Namespaced
-        variants), run that on the latest release (CLI or lab), and say in the evidence which policy you ran on which
-        release. The CEL libraries and migration documents in the context directory give the syntax: look a function
-        up there before guessing its arguments.
+        Policy). When you test the latest release and it refuses the report's policy for that reason, write the
+        equivalent policies.kyverno.io policy (ValidatingPolicy, MutatingPolicy or GeneratingPolicy, or their
+        Namespaced variants), run that instead, and say in the evidence which policy you ran on which release. The
+        CEL libraries and migration documents in the context directory give the syntax: look a function up there
+        before guessing its arguments.
   # A throwaway kind cluster in the run, for reports that need a running cluster. Drop this import for CLI only.
   - uses: kyverno/assistant/workflows/shared/security-triage-lab.md@main
     with:

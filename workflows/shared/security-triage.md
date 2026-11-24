@@ -470,6 +470,11 @@ jobs:
           repositories: ${{ steps.target.outputs.name }}
           # Not a declared input of the action, which forwards every permission-* input; Actions warns about it.
           permission-repository-advisories: read
+      # The manifest extraction parses YAML. Ubuntu's own package, so nothing is fetched from PyPI; usually already there.
+      - name: Make sure PyYAML is installed
+        run: |
+          python3 -c "import yaml" 2>/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml; }
+          python3 -c "import yaml; print('PyYAML', yaml.__version__)"
       - id: collect
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
@@ -481,10 +486,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import hashlib, json, os, re, subprocess
-          try:
-              import yaml
-          except ImportError:
-              yaml = None
+          import yaml
 
           MARKER = re.compile(r"<!-- security-triage:v1 fingerprint=([0-9a-f]{16}) classification=([a-z-]+) -->")
           MAX_DESCRIPTION, MAX_COMMENT, MAX_COMMENTS = 12000, 3000, 10
@@ -558,8 +560,6 @@ jobs:
 
           def manifests_from(sources):
               """The Kubernetes objects in the code blocks of [(label, text)], and notes on what was left out."""
-              if yaml is None:
-                  return [], ["the manifests were not extracted: PyYAML is not installed on the runner"]
               found, notes, seen, total = [], [], set(), 0
               for label, text in sources:
                   for b, (lang, block) in enumerate(fenced_blocks(text), 1):

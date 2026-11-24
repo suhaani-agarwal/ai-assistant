@@ -420,9 +420,6 @@ class Lab(unittest.TestCase):
         self.assertEqual(inputs, ["hello\n", "x: 1\n"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
     def test_a_manifest_file_is_read_by_the_tool_and_piped_but_only_from_the_allowed_directories(self):
         inputs = []
@@ -480,6 +477,28 @@ if __name__ == "__main__":
         self.assertIn(["kubectl", "auth", "can-i", "create", "configmaps", "-n", "probe-tenant",
                        "--as=system:serviceaccount:probe-tenant:probe-user"], can_i)
 
+    def test_inline_values_are_kept_out_of_the_log(self):
+        r = lambda a: " ".join(self.s["redact"](a.split()))
+        self.assertEqual(r("create secret generic s --from-literal=token=abc123 -n t"),
+                         "create secret generic s --from-literal=token=<value> -n t")
+        self.assertEqual(r("patch cm x -p {\"data\":{\"k\":\"v\"}}"), "patch cm x -p <value>")
+        self.assertEqual(r("patch cm x --patch={\"a\":1} --type=merge"), "patch cm x --patch=<value> --type=merge")
+        self.assertEqual(r("run p --image=busybox --env=PASS=hunter2"), "run p --image=busybox --env=PASS=<value>")
+        self.assertEqual(r("logs -p -n kyverno pod-1"), "logs -p -n kyverno pod-1")
+        self.assertEqual(r("annotate cm x target_ns=kube-system"), "annotate cm x target_ns=kube-system")
+
+    def test_a_long_user_name_and_a_failed_permission_check_are_errors_not_results(self):
+        def fake(cmd, **kw):
+            if "can-i" in cmd:
+                return subprocess.CompletedProcess(cmd, 1, "", "error: the server doesn't have a resource type \"x\"\n")
+            return subprocess.CompletedProcess(cmd, 0, "applied\n", "")
+        with mock.patch.object(self.s["subprocess"], "run", fake), mock.patch("sys.stdout") as stdout:
+            self.assertEqual(self.s["tenant"](rules="get:pods", user="u" * 56), 2)
+            self.assertEqual(self.s["tenant"](rules="get:pods"), 1)
+            printed = "".join(c.args[0] for c in stdout.write.call_args_list)
+        self.assertIn("failed", printed)
+        self.assertNotIn("what the user can do", printed)
+
     def test_each_command_is_logged_with_the_advisory_and_release_of_the_last_install(self):
         def fake(cmd, **kw):
             out = json.dumps([{"version": "3.6.1", "app_version": "v1.16.1"}]) if "search" in cmd else ""
@@ -500,6 +519,7 @@ if __name__ == "__main__":
             (GHSA, "", "lab-reset"),
             (GHSA, "", "kubectl get pods -A"),
         ])
+
 
 class Unfinished(unittest.TestCase):
     def setUp(self):
@@ -579,3 +599,7 @@ class Unfinished(unittest.TestCase):
             self.run_main({"items": []}, fail_on=(GHSA,))
         self.assertIn(GHSA, str(e.exception))
         self.assertNotIn(OTHER, str(e.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()

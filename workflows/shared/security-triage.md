@@ -204,9 +204,7 @@ safe-outputs:
           type: string
           max-length: 4000
         evidence:
-          description: >-
-            Commands you ran and the relevant lines of their output. Excerpts only, no secrets. Only what you ran and
-            saw: anything taken from the report without running it is marked "reported, not run".
+          description: "Commands you ran and the relevant lines of their output. Excerpts only, no secrets."
           required: false
           type: string
           max-length: 5000
@@ -993,9 +991,10 @@ ${{ needs.collect.outputs.json }}
       can run that exact release, use the closest release you can run instead: put that one in `result_release`,
       set `closest_release` to true, and say in the assessment why the reported one could not be run.
    c. Check the same claim on a newer release before anything else: the newest patch of the same minor release if
-      you can install it (the report's policy runs there unchanged). If it no longer appears there, that release is
-      `fixed_in`: stop checking newer releases for this claim and say in the verdict that later ones were not tested.
-      Only if it still appears, check the latest release too.
+      you can install it (the report's policy runs there unchanged). If the report's steps ran there and the impact
+      did not appear, that release is `fixed_in`: stop checking newer releases for this claim and say in the verdict
+      that later ones were not tested. A policy or resource refused on that release is not a fix: say you could not
+      test it there and check the latest release. Only if the impact still appears, check the latest release too.
    d. Only then look at the report's further claims (for example that the same flaw also allows writes or
       privilege escalation). Build one only if it would change the severity; otherwise reason from what you have
       already shown, and say in the verdict which claims you ran and which you reasoned about.
@@ -1020,10 +1019,8 @@ You are checking whether a claim holds, the way a test does. Write it like a tes
   names, messages or your notes.
 - If something you wrote is rejected or fails to compile on a release, say that you could not express the claim
   there and quote the error. Do not infer how the release behaves from an error message alone.
-- Evidence is only what you ran and saw. Anything you take from the report without running it, write as
-  "reported, not run", and leave it out of the CVSS vector. Never write that you verified something you did not run:
-  the comment also lists the commands the lab recorded, so a lab command in your evidence that is not in that list
-  shows.
+- Evidence is only what you ran and saw. Write anything you take from the report without running it as "reported,
+  not run", and never as verified.
 - Describe results as observations: "the canary value from kube-system appeared in the admission response to a user
   who cannot read kube-system", not as an attack story.
 

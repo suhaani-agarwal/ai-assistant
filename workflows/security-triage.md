@@ -74,8 +74,7 @@ imports:
         PolicyExceptions or Kyverno's ConfigMap already assumes cluster-admin-equivalent power unless the report
         shows a namespaced user doing it. Policies with failurePolicy Ignore, excluded namespaces or excluded groups
         behave as configured. Kyverno v1.20 and later reject the legacy kyverno.io policy types (ClusterPolicy,
-        Policy). You test the latest release only when the newest patch of the reported minor release still shows
-        the impact. If the latest CLI refuses the report's policy for that reason, write the equivalent
+        Policy). If the latest CLI refuses the report's policy for that reason, write the equivalent
         policies.kyverno.io policy (ValidatingPolicy, MutatingPolicy or GeneratingPolicy, or their Namespaced
         variants), run that on the latest release (CLI or lab), and say in the evidence which policy you ran on which
         release. The CEL libraries and migration documents in the context directory give the syntax: look a function

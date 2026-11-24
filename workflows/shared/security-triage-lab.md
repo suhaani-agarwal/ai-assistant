@@ -83,6 +83,28 @@ steps:
           print(f"exit {code}\n{text}")
           return code
 
+      # Arguments that carry values inline. The log keeps the flag and key, not the value, as it may come from a report.
+      VALUE_FLAGS = ("--from-literal", "--env", "--patch", "--overrides")
+
+      def redact(tokens):
+          # -p is the patch for `kubectl patch`, but --previous for `kubectl logs`.
+          flags = VALUE_FLAGS + (("-p",) if tokens[:1] == ["patch"] else ())
+          shown, hide_next = [], False
+          for t in tokens:
+              name, eq, value = t.partition("=")
+              if hide_next:
+                  shown.append("<value>")
+                  hide_next = False
+              elif name in flags and eq:
+                  key = value.split("=", 1)[0] if name in ("--from-literal", "--env") and "=" in value else ""
+                  shown.append(f"{name}={key + '=' if key else ''}<value>")
+              elif t in flags:
+                  shown.append(t)
+                  hide_next = True
+              else:
+                  shown.append(t)
+          return shown
+
       def state():
           try:
               with open(STATE) as f:
@@ -260,6 +282,8 @@ steps:
               for n in (ns, other, user):
                   if not NAME.match(n):
                       raise ValueError(f"{n!r} is not a valid Kubernetes name")
+              if len(user) > 55:
+                  raise ValueError("user is limited to 55 characters, so its Role and RoleBinding names fit")
               if ns == other:
                   raise ValueError("the other namespace must differ from the user's")
               parsed = parse_rules(rules)
@@ -293,9 +317,12 @@ steps:
           lines = []
           for verb, resource, where in checks:
               scope = ["-n", where] if where else ["--all-namespaces"]
-              _, answer = run(["kubectl", "auth", "can-i", verb, resource, *scope, f"--as={as_user}"], timeout=60)
-              lines.append(f"  {answer.strip().splitlines()[0] if answer.strip() else '?':4} {verb} {resource} "
-                           + (f"-n {where}" if where else "--all-namespaces"))
+              # can-i exits 1 for "no", so the answer is read from its output; anything else is an error, not a result.
+              code, answer = run(["kubectl", "auth", "can-i", verb, resource, *scope, f"--as={as_user}"], timeout=60)
+              first = answer.strip().splitlines()[0] if answer.strip() else ""
+              if first not in ("yes", "no"):
+                  return out(code or 1, f"the user was created, but `auth can-i {verb} {resource}` failed:\n{answer}")
+              lines.append(f"  {first:4} {verb} {resource} " + (f"-n {where}" if where else "--all-namespaces"))
           return out(0, f"act as this user with: --as={as_user}\n"
                         f"canary value: {canary}, in ConfigMap {other}/probe-canary and Secret {other}/probe-canary "
                         "(key `value`)\n"
@@ -320,7 +347,7 @@ steps:
                   return out(2, f"stdin does not end with the line `{END_MARKER}`, so it was probably cut off before "
                                 "the end. Nothing was applied. Send the whole manifest again, ending with that line.")
           code, text = run(["kubectl", "--request-timeout=90s", *tokens], stdin=stdin or None, timeout=150)
-          log("kubectl " + shlex.join(tokens) + (f" < {os.path.basename(file)}" if file else " < stdin" if stdin else ""), code)
+          log("kubectl " + shlex.join(redact(tokens)) + (f" < {os.path.basename(file)}" if file else " < stdin" if stdin else ""), code)
           return out(code, text)
 
       def main(argv):
@@ -454,9 +481,7 @@ controller crashing. Use the CLI for what the CLI can show on its own.
 - `lab-install` installs a release with Helm, for the advisory you name in `ghsa_id`: a version such as `v1.16.1`, a minor such as `v1.16` for its newest
   patch, or `latest`. Its output names the release it installed. Pass Helm values when the report needs a non-default
   setting, and say in your verdict which ones you set and why.
-- `lab-tenant` does the usual setup for a report about a namespaced user in one call: the user with exactly the
-  permissions you give, a second namespace with a canary value, and `auth can-i` results showing the user cannot
-  already reach it. Use it instead of building these by hand, and again after each `lab-reset`.
+- `lab-tenant` sets up a namespaced user, a namespace it should not reach and a canary value there, in one call.
 - `lab-kubectl` runs one kubectl command. For a manifest from the report, use `-f -` with `file` set to its listed
   path, and do not retype it. The same works for a file you wrote in your scratch directory, so you can apply it
   again on the next release without sending it twice. Otherwise put the manifest in `stdin` with `-f -`, and end
@@ -470,22 +495,21 @@ How to use it:
 1. Build only what the report needs. For a report about a namespaced user, call `lab-tenant` with exactly the
    permissions the report says the user has: it creates the user, a namespace it should not reach and a canary value
    there, so that "the value appeared" or "it changed" is something you can see, not something you infer. Read its
-   `auth can-i` results: if the user can already reach the other namespace, the report's claim proves nothing. Add
-   anything else the report needs with `lab-kubectl`.
+   `auth can-i` results: if the user can already reach the other namespace, the report's claim proves nothing. Call it
+   again after each `lab-reset`, and add anything else the report needs with `lab-kubectl`.
 2. Install the version the report names, follow the report's steps for its main claim as that account, and record
    what you observe: denials, the canary showing up where it should not, a resource changed, a controller
    restarting (`get pods -n <namespace>` restart counts and `logs --previous`). Record the verdict so far.
 3. Then `lab-reset`, install the newest patch of the same minor release (for a report on v1.16.1, install `v1.16`),
    and repeat the same claim with the same policy. Fixes usually ship as patches, so this shows whether the claim is
    fixed, and the report's policy runs there unchanged.
-4. Only if the claim still appears on that patch: `lab-reset`, install `latest`, and repeat it, so you can say
-   whether it still happens today. If the latest release no longer accepts the report's policy, follow this
-   project's rules for the replacement. If the patch no longer shows it, that patch is `fixed_in`: do not install
-   `latest` or write a replacement policy, and say in the verdict that later releases were not tested.
+4. Only when the steps for advisories say to check the latest release: `lab-reset`, install `latest`, and repeat
+   the claim. If the latest release no longer accepts the report's policy, follow this project's rules for the
+   replacement.
 5. Do steps 3 and 4 before trying any further claim from the report. `lab-reset` before moving to the next
    advisory.
 
-The lab records every command it runs, and the verdict comment lists them. Your evidence must match that list.
+The lab records every command it runs, and the verdict comment lists them next to your evidence.
 
 If a report needs something the lab cannot provide (a cloud provider, several nodes, an unreleased build, the
 public internet), say exactly what was missing in your verdict and call `report_missing_tool` naming it, then

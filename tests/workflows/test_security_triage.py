@@ -162,14 +162,99 @@ class Collect(unittest.TestCase):
             def __enter__(self): return self
             def __exit__(self, *a): return False
             def read(self, *a): return self.body
-        pages = [Resp(b'[{"tag_name": "v1.20.0"}, {"tag_name": "v1.20.0-rc.1", "prerelease": true}]',
+        pages = [Resp(b'[{"tag_name": "v1.20.0", "published_at": "2026-11-12T09:32:42Z"},'
+                      b' {"tag_name": "v1.20.0-rc.1", "prerelease": true}]',
                       '<https://api.github.com/x?page=2>; rel="next"'),
-                 Resp(b'[{"tag_name": "v1.19.2"}]')]
+                 Resp(b'[{"tag_name": "v1.19.2", "published_at": "2026-10-20T23:50:19Z"}]')]
         refused = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "403")
         with mock.patch.object(self.s["subprocess"], "run", refused), \
              mock.patch.object(self.s["urllib"].request, "urlopen", lambda *a, **k: pages.pop(0)), \
              mock.patch.dict(os.environ, {"RELEASES_TOKEN": "t"}), mock.patch("sys.stdout"):
-            self.assertEqual(self.s["releases_of"]("kyverno/kyverno"), ["v1.20.0", "v1.19.2"])
+            self.assertEqual(self.s["releases_of"]("kyverno/kyverno"),
+                             [("v1.20.0", "2026-11-12T09:32:42Z"), ("v1.19.2", "2026-10-20T23:50:19Z")])
+
+    def test_the_release_list_read_with_the_token_carries_publish_dates(self):
+        pages = json.dumps([[{"tag_name": "v1.20.0", "published_at": "2026-11-12T09:32:42Z"},
+                             {"tag_name": "v1.21.0-rc.1", "prerelease": True, "published_at": "2026-11-20T00:00:00Z"},
+                             {"tag_name": "v1.21.0", "draft": True}]])
+        ok = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, pages, "")
+        with mock.patch.object(self.s["subprocess"], "run", ok), mock.patch.dict(os.environ, {"RELEASES_TOKEN": "t"}):
+            self.assertEqual(self.s["releases_of"]("kyverno/kyverno"), [("v1.20.0", "2026-11-12T09:32:42Z")])
+
+    # Publish dates of real Kyverno releases. v1.16.4 came out after v1.17.2.
+    DATED = [("v1.20.0", "2026-11-12T09:32:42Z"), ("v1.19.2", "2026-10-20T23:50:19Z"),
+             ("v1.18.1", "2026-05-18T10:30:23Z"), ("v1.17.2", "2026-04-23T15:12:09Z"),
+             ("v1.16.4", "2026-04-23T16:31:55Z"), ("v1.16.2", "2026-01-09T14:08:06Z"), ("v1.20.1", None)]
+
+    def test_with_no_range_the_reported_release_is_the_highest_one_out_when_the_report_was_filed(self):
+        filed = self.s["filed_release"]
+        self.assertEqual(filed("2026-06-01T00:00:00Z", self.DATED), "v1.18.1")
+        self.assertEqual(filed("2026-04-23T17:00:00Z", self.DATED), "v1.17.2")  # by version, not by date
+        self.assertEqual(filed("2026-11-12T09:32:41Z", self.DATED), "v1.19.2")  # a second before v1.20.0
+        self.assertEqual(filed("2026-11-30T00:00:00Z", self.DATED), "v1.20.0")  # an undated release never counts
+        self.assertIsNone(filed("2025-01-01T00:00:00Z", self.DATED))
+        self.assertIsNone(filed(None, self.DATED))
+        self.assertIsNone(filed("yesterday", self.DATED))
+
+    def test_the_picked_advisory_says_where_its_reported_release_came_from(self):
+        ranged = advisory(vulnerabilities=[{"package": {"name": "github.com/kyverno/kyverno"},
+                                            "vulnerable_version_range": "<= 1.16.2"}], created_at="2026-11-24T13:03:55Z")
+        dated = advisory(OTHER, vulnerabilities=None, created_at="2026-06-01T00:00:00Z")
+        old = advisory("GHSA-6jwp-h9x3-2c4m", vulnerabilities=[], created_at="2020-01-01T00:00:00Z")
+        todo, _ = self.s["pick"]([ranged, dated, old], self.comments({}), 3, "", self.DATED, "github.com/kyverno/kyverno")
+        got = {t["ghsa_id"]: (t["reported_release"], t["reported_release_source"]) for t in todo}
+        self.assertEqual(got, {GHSA: ("v1.16.2", "range"), OTHER: ("v1.18.1", "filed-date"),
+                               "GHSA-6jwp-h9x3-2c4m": (None, None)})
+
+    FULL = {"vulnerabilities": [{"package": {"name": "github.com/kyverno/kyverno"}, "vulnerable_version_range": "<= 1.19.0"}],
+            "cvss": {"vector_string": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H", "score": 9.9},
+            "cwe_ids": ["CWE-269"], "cwes": [{"cwe_id": "CWE-269"}]}
+
+    def test_advisories_listed_without_their_details_are_completed_from_the_advisory_alone(self):
+        # As the App token listed a draft: severity and text, but no ranges, vector or CWEs.
+        thin = advisory(vulnerabilities=None, cvss={"vector_string": None, "score": None}, cwe_ids=None)
+        whole = advisory(OTHER, **self.FULL)
+        asked = []
+        def get_one(g):
+            asked.append(g)
+            return dict(advisory(g), **self.FULL)
+        counts = self.s["complete"]([thin, whole], get_one)
+        self.assertEqual(counts, (1, 2, 0))
+        self.assertEqual(asked, [GHSA])  # a complete one is not read again
+        self.assertEqual(thin["vulnerabilities"], self.FULL["vulnerabilities"])
+        self.assertEqual(self.s["cvss_vector"](thin), self.FULL["cvss"]["vector_string"])
+        self.assertEqual(thin["cwe_ids"], ["CWE-269"])
+        self.assertEqual(thin["description"], "Steps...")  # nothing else is replaced
+        # The completed range picks the release, not the filing date (which would give v1.20.0, already fixed).
+        thin["created_at"] = "2026-11-24T13:03:55Z"
+        todo, _ = self.s["pick"]([thin], self.comments({}), 1, "", self.DATED, "github.com/kyverno/kyverno")
+        self.assertEqual((todo[0]["reported_release"], todo[0]["reported_release_source"]), ("v1.18.1", "range"))
+
+    def test_an_advisory_that_cannot_be_read_alone_is_counted_and_never_named_in_the_log(self):
+        thin = advisory(vulnerabilities=None)
+        self.assertEqual(self.s["complete"]([thin], lambda g: None), (0, 0, 1))
+        self.assertEqual(self.s["complete"]([advisory(vulnerabilities=None)], lambda g: advisory(OTHER, **self.FULL)),
+                         (0, 0, 1))  # someone else's advisory is not used
+        self.assertIsNone(thin["vulnerabilities"])
+        failed = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "report text", "")
+        with mock.patch.object(self.s["subprocess"], "run", failed), mock.patch("sys.stdout") as stdout:
+            self.assertIsNone(self.s["gh_get"](f"repos/o/r/security-advisories/{GHSA}"))
+            self.assertIsNone(self.s["gh_list"](f"repos/o/r/security-advisories/{GHSA}/comments?per_page=100"))
+            printed = "".join(c.args[0] for c in stdout.write.call_args_list)
+        self.assertNotIn(GHSA, printed)
+        self.assertNotIn("report text", printed)
+        self.assertIn("security-advisories/<GHSA>/comments failed", printed)
+
+    def test_collect_reads_with_a_write_token_and_writes_the_agents_input_indented(self):
+        front, _ = split_component(SHARED)
+        mint = next(s for s in front["jobs"]["collect"]["steps"] if s.get("id") == "app")
+        self.assertEqual(mint["with"]["permission-repository-advisories"], "write")
+        self.assertIn('json.dump({"advisories": todo, "published": published}, f, indent=2)', SHARED.read_text())
+        # main() completes every listed advisory from the single-advisory endpoint, before anything is picked.
+        text = SHARED.read_text()
+        wired = 'complete(\n                  advisories, lambda g: gh_get(f"repos/{target}/security-advisories/{g}"))'
+        self.assertIn(wired, text)
+        self.assertLess(text.index(wired), text.index("todo, index = pick("))
 
     def test_every_published_advisory_is_kept_for_duplicate_checks(self):
         self.assertIn('state=published&per_page=100") or [])]\n', SHARED.read_text())
@@ -177,7 +262,7 @@ class Collect(unittest.TestCase):
     def test_the_picked_advisory_carries_its_reported_release(self):
         adv = advisory(vulnerabilities=[{"package": {"ecosystem": "go", "name": "github.com/kyverno/kyverno"},
                                          "vulnerable_version_range": "<= 1.18.1"}])
-        todo, _ = self.s["pick"]([adv], self.comments({}), 3, "", self.RELEASES)
+        todo, _ = self.s["pick"]([adv], self.comments({}), 3, "", [(r, None) for r in self.RELEASES])
         self.assertEqual(todo[0]["reported_release"], "v1.18.1")
 
     def test_an_unfinished_advisory_waits_behind_new_ones_and_still_gets_a_free_slot(self):
@@ -865,6 +950,28 @@ class Prompt(unittest.TestCase):
         self.assertIn("CLI or,\nif there is one, the lab", self.shared)
         self.assertNotIn("inside your scratch directory. Your only output", self.shared)
         self.assertIn("never rewrite one only to rename it", self.shared)
+
+    def test_the_reported_release_is_worked_out_before_the_agent_and_the_reports_own_is_only_a_check(self):
+        self.assertNotIn("the latest if it names none", self.step3)
+        self.assertNotIn("Only if it is\n      empty, use the release the report says", self.step3)
+        self.assertIn("A release the report says it tested never replaces `reported_release`", self.step3)
+        self.assertIn("If `reported_release` is empty, run nothing", self.step3)
+        advisories = re.search(r"## The advisories\n.*?\n## ", self.shared, re.S).group(0)
+        self.assertIn("`reported_release_source` says which: `range` or `filed-date`", advisories)
+        self.assertIn("published before the report was\nfiled", advisories)
+
+    def test_the_input_file_is_read_with_jq(self):
+        advisories = re.search(r"## The advisories\n.*?\n## ", self.shared, re.S).group(0)
+        self.assertIn("Read that file first, with `jq`", advisories)
+        self.assertIn("jq", self.shared_front["tools"]["bash"])
+
+    def test_an_escalation_chain_is_proved_only_up_to_its_first_boundary(self):
+        how = re.search(r"## How to write what you run\n.*?\n## ", self.shared, re.S).group(0)
+        self.assertIn("prove only the first step that crosses a boundary", how)
+        self.assertIn("Never build webhooks, certificates, sidecars or any later step of the chain", how)
+        self.assertIn("even where step 3c would test a\n  further claim", how)
+        everything = "\n".join([self.shared, self.lab, self.rules, self.tools, self.fields])
+        self.assertEqual(everything.count("first step that crosses a boundary"), 1)
 
     def test_lab_tenant_takes_the_reports_own_names(self):
         inputs = self.lab_front["mcp-scripts"]["lab-tenant"]["inputs"]

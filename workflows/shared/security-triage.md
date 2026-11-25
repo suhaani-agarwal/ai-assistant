@@ -551,7 +551,10 @@ jobs:
           owner: ${{ steps.target.outputs.owner }}
           repositories: ${{ steps.target.outputs.name }}
           # Not a declared input of the action, which forwards every permission-* input; Actions warns about it.
-          permission-repository-advisories: read
+          # Write, though collect only reads: with read, the list returned drafts without their version ranges, CVSS
+          # vector or CWEs. GitHub may show those only to a caller that can write advisories (not confirmed). Collect
+          # makes no write call and runs no model.
+          permission-repository-advisories: write
       # The manifest extraction parses YAML. Ubuntu's own package, so nothing is fetched from PyPI; usually already there.
       - name: Make sure PyYAML is installed
         run: |
@@ -571,6 +574,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import hashlib, json, os, re, subprocess, urllib.request
+          from datetime import datetime
           import yaml
 
           MARKER = re.compile(r"<!-- security-triage:v1 fingerprint=([0-9a-f]{16}) classification=([a-z-]+) -->")
@@ -613,10 +617,37 @@ jobs:
                           found.append((ver(m), tag))
               return max(found)[1] if found else None
 
+          def when(stamp):
+              """A GitHub timestamp as a datetime, or None."""
+              try:
+                  return datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+              except ValueError:
+                  return None
+
+          def filed_release(created_at, releases):
+              """When no range can be read: the release that was current when the report was filed, i.e. the highest
+              release published before the advisory's created_at. Highest by version, not by date, since a patch to an
+              older minor can come out after the newest release. None if no release is older than the report."""
+              filed = when(created_at)
+              found = []
+              for tag, published in releases:
+                  m, at = RELEASE.match(tag), when(published)
+                  if m and filed and at and at < filed:
+                      found.append((tuple(map(int, m.groups())), tag))
+              return max(found)[1] if found else None
+
+          def first_release(adv, releases, package):
+              """(release to test first, where it came from): the advisory's version range, else its filing date."""
+              tag = reported_release(adv.get("vulnerabilities"), [t for t, _ in releases], package)
+              if tag:
+                  return tag, "range"
+              tag = filed_release(adv.get("created_at"), releases)
+              return (tag, "filed-date") if tag else (None, None)
+
           def releases_of(repo):
-              """Published, non-prerelease release tags of the project. Stops the run if they cannot be read: without
-              them every reported release would be empty and the agent would fall back to guessing one, so it is better
-              to triage nothing and let the next run try again."""
+              """(tag, published_at) of each published, non-prerelease release of the project. Stops the run if they
+              cannot be read: without them every reported release would be empty and the agent would fall back to
+              guessing one, so it is better to triage nothing and let the next run try again."""
               r = subprocess.run(["gh", "api", "--paginate", "--slurp", f"repos/{repo}/releases?per_page=100"],
                                  capture_output=True, text=True, env=dict(os.environ, GH_TOKEN=os.environ["RELEASES_TOKEN"]))
               if r.returncode == 0:
@@ -627,7 +658,8 @@ jobs:
                   pages = public_pages(f"https://api.github.com/repos/{repo}/releases?per_page=100")
                   if pages is None:
                       raise SystemExit(f"::error::Could not list the releases of {repo}; nothing is triaged this run")
-              return [x["tag_name"] for page in pages for x in page if not x.get("draft") and not x.get("prerelease")]
+              return [(x["tag_name"], x.get("published_at")) for page in pages for x in page
+                      if not x.get("draft") and not x.get("prerelease")]
 
           def public_pages(url, limit=10):
               """Pages of a public GitHub API list, without a token, following Link headers; None on any error."""
@@ -772,20 +804,58 @@ jobs:
                       m["file"] = f"{g}/{m['file']}"
                   item["manifests"], item["manifest_notes"] = found, notes
 
+          def quiet(path):
+              """An API path fit for a public log: no query and no GHSA ID, which would say which reports exist."""
+              return re.sub(r"GHSA(-[23456789cfghjmpqrvwx]{4}){3}", "<GHSA>", path.split("?")[0])
+
           def gh_list(path):
               r = subprocess.run(["gh", "api", "--paginate", "--slurp", path], capture_output=True, text=True)
               if r.returncode:
                   # Never print the response: on a private report it can hold report text.
-                  print(f"::warning::GET {path.split('?')[0]} failed (exit {r.returncode})")
+                  print(f"::warning::GET {quiet(path)} failed (exit {r.returncode})")
                   return None
               out = []
               for page in json.loads(r.stdout or "[]"):
                   out.extend(page if isinstance(page, list) else [page])
               return out
 
+          def gh_get(path):
+              """One object from the API, or None. Never prints the response."""
+              r = subprocess.run(["gh", "api", path], capture_output=True, text=True)
+              if r.returncode:
+                  print(f"::warning::GET {quiet(path)} failed (exit {r.returncode})")
+                  return None
+              try:
+                  obj = json.loads(r.stdout or "null")
+              except ValueError:
+                  return None
+              return obj if isinstance(obj, dict) else None
+
           def cvss_vector(adv):
               return (adv.get("cvss") or {}).get("vector_string") or \
                   ((adv.get("cvss_severities") or {}).get("cvss_v3") or {}).get("vector_string") or ""
+
+          def complete(advisories, get_one):
+              """Fill in the version ranges, CVSS vector and CWEs of each listed advisory that came without them, from
+              the advisory read on its own (`get_one(ghsa)`). Seen with the App token: the list returned drafts without
+              them while the same token's other fields arrived. Every listed advisory is completed, not only the ones
+              picked, so its fingerprint is the same from run to run. Returns counts for the log: (with a range as
+              listed, with a range after completing, not readable on its own)."""
+              as_listed = sum(1 for a in advisories if a.get("vulnerabilities"))
+              unreadable = 0
+              for adv in advisories:
+                  if adv.get("vulnerabilities") and cvss_vector(adv) and adv.get("cwe_ids") is not None:
+                      continue
+                  full = get_one(adv["ghsa_id"])
+                  if not isinstance(full, dict) or full.get("ghsa_id") != adv["ghsa_id"]:
+                      unreadable += 1
+                      continue
+                  for k in ("vulnerabilities", "cwe_ids", "cwes"):
+                      if full.get(k) and not adv.get(k):
+                          adv[k] = full[k]
+                  if cvss_vector(full) and not cvss_vector(adv):
+                      adv["cvss"], adv["cvss_severities"] = full.get("cvss"), full.get("cvss_severities")
+              return as_listed, sum(1 for a in advisories if a.get("vulnerabilities")), unreadable
 
           def fingerprint(adv, reporter_comments):
               material = {k: adv.get(k) for k in ("summary", "description", "severity", "cwe_ids", "vulnerabilities")}
@@ -816,6 +886,7 @@ jobs:
                   reporter = (adv.get("author") or {}).get("login")
                   reporter_comments = [c for c in comments if (c.get("user") or {}).get("login") == reporter]
                   fp = fingerprint(adv, reporter_comments)
+                  release, source = first_release(adv, releases, package)
                   mine, old_fp, old_cls = bot_comment(comments)
                   if old_fp == fp and not only:
                       continue
@@ -826,7 +897,7 @@ jobs:
                       "reporter": reporter, "reported_severity": adv.get("severity"),
                       "reported_cvss_vector": cvss_vector(adv), "cwe_ids": adv.get("cwe_ids"),
                       "vulnerabilities": adv.get("vulnerabilities"), "created_at": adv.get("created_at"),
-                      "reported_release": reported_release(adv.get("vulnerabilities"), releases, package),
+                      "reported_release": release, "reported_release_source": source,
                       "previous_bot_result": old_cls,
                       "comments": [{"author": (c.get("user") or {}).get("login"),
                                     "is_reporter": (c.get("user") or {}).get("login") == reporter,
@@ -848,6 +919,11 @@ jobs:
               advisories = []
               for state in json.loads(os.environ["STATES"]):
                   advisories += gh_list(f"repos/{target}/security-advisories?state={state}&per_page=100") or []
+              as_listed, with_range, unreadable = complete(
+                  advisories, lambda g: gh_get(f"repos/{target}/security-advisories/{g}"))
+              # Counts only: the log of a public repository must not carry report text or which reports exist.
+              print(f"{as_listed} of {len(advisories)} unpublished advisories carry a version range as listed, "
+                    f"{with_range} after reading the others one by one ({unreadable} could not be read)")
               cache = {}
               def comments_for(g):
                   if g not in cache:
@@ -862,12 +938,15 @@ jobs:
                             "severity": a.get("severity"), "cwe_ids": a.get("cwe_ids")}
                            for a in (gh_list(f"repos/{target}/security-advisories?state=published&per_page=100") or [])]
               print(f"{len(advisories)} unpublished advisories, {len(todo)} to triage")
+              sources = [t["reported_release_source"] for t in todo]
+              print(f"Reported release from a version range: {sources.count('range')}, from the filing date: "
+                    f"{sources.count('filed-date')}, none: {sources.count(None)}")
               os.makedirs("/tmp/security-triage-index", exist_ok=True)
               with open("/tmp/security-triage-index/index.json", "w") as f:
                   json.dump(index, f)
               os.makedirs(ADVISORIES_DIR, exist_ok=True)
               with open(os.path.join(ADVISORIES_DIR, "advisories.json"), "w") as f:
-                  json.dump({"advisories": todo, "published": published}, f)
+                  json.dump({"advisories": todo, "published": published}, f, indent=2)
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                   f.write(f"count={len(todo)}\n")
 
@@ -1082,9 +1161,13 @@ if there is one, the lab. Your only output is `post_advisory_verdict`, for the a
 ## The advisories
 
 A step that ran before you chose the advisories for this run and wrote them to
-`/tmp/gh-aw/security-triage/input/advisories.json`. Read that file first. Triage exactly these, no others.
+`/tmp/gh-aw/security-triage/input/advisories.json`. Read that file first, with `jq`: it can be too long for `cat`
+or `view` to show whole. For example `jq '.advisories[] | {ghsa_id, summary, reported_release}' <file>`, then
+`jq -r '.advisories[0].description' <file>`. Triage exactly these, no others.
 `advisories` holds the reports; `published` holds the project's published advisories, for spotting duplicates.
-`reported_release` is the release to test first, worked out from the advisory's version range.
+`reported_release` is the release to test first, worked out before you started: the newest release inside the
+advisory's version range or, if it has no range that can be read, the newest release published before the report was
+filed. `reported_release_source` says which: `range` or `filed-date`.
 `previous_bot_result` is your earlier result if the report changed since you last looked; reporter comments may
 answer your questions.
 
@@ -1122,13 +1205,15 @@ answer your questions.
    exit code and the lines of output that matter. This is the order of releases to test; nothing else adds one:
    a. Pick the report's main claim: the one impact the rest depends on.
    b. Reproduce it on the reported release, and put that release in `result_release`. The reported release is the
-      advisory's `reported_release`: install exactly that one first, whatever else the report mentions. Only if it is
-      empty, use the release the report says it tested, or the latest if it names none. Only if you tried and neither
-      the CLI nor the lab could run it, use the closest release instead: put that one in `result_release`, set
-      `closest_release` to true, and say in the assessment why the reported one could not be run. Use the report's
-      own files. If they run and the impact does not appear, make at most two changes the report's text supports (a
-      missing namespace, permission or setting), then record what you saw instead of building variants of your own,
-      test the main claim once on the latest release in case the report names the wrong release, and stop.
+      advisory's `reported_release`: install exactly that one first, whatever else the report mentions.
+      Only if you tried and neither the CLI nor the lab could run it, use the closest release instead: put that one
+      in `result_release`, set `closest_release` to true, and say in the assessment why the reported one could not
+      be run. A release the report says it tested never replaces `reported_release`; if the two differ, say so in
+      the assessment. If `reported_release` is empty, run nothing: classify it `needs-more-info` and ask the
+      reporter which release they tested. Use the report's own files. If they run and the impact does not appear,
+      make at most two changes the report's text supports (a missing namespace, permission or setting), then record
+      what you saw instead of building variants of your own, test the main claim once on the latest release in case
+      the report names the wrong release, and stop.
    c. While that release is still in use, test a further claim of the report (for example that the same flaw also
       allows writes) only if it would change the severity; otherwise reason from what you have shown. Say in the
       verdict which claims you ran and which you reasoned about.
@@ -1155,6 +1240,10 @@ You are checking whether a claim holds, the way a test does. Write it like a tes
 - Build the smallest thing that shows the claimed impact, and stop once you have observed it or shown it does not
   happen. Do not extend the report beyond its claim or build anything it does not need. Prefer showing a read (a
   canary value appearing) over building a write when either would prove the claim.
+- For a report that chains several steps up to cluster admin, prove only the first step that crosses a boundary, with
+  a harmless object: a probe ConfigMap written in another namespace, a ClusterRole with no rules, or an audit-only
+  policy. Never build webhooks, certificates, sidecars or any later step of the chain, even where step 3c would test a
+  further claim; reason about the remaining steps in the assessment.
 - Use neutral names for what you write: `probe-*` for policies and resources, `canary-*` for the values you plant,
   and plain messages such as `value: {{...}}`. Do not use words like malicious, evil, attack, exploit, leak or steal
   in those names, messages or your notes. The report's files keep their own names: refer to them by file name, and

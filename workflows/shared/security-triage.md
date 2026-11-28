@@ -835,27 +835,36 @@ jobs:
               return (adv.get("cvss") or {}).get("vector_string") or \
                   ((adv.get("cvss_severities") or {}).get("cvss_v3") or {}).get("vector_string") or ""
 
+          def ranged(adv):
+              """How many of an advisory's affected-product entries carry a version range."""
+              return sum(1 for v in adv.get("vulnerabilities") or []
+                         if str((v or {}).get("vulnerable_version_range") or "").strip())
+
           def complete(advisories, get_one):
               """Fill in the version ranges, CVSS vector and CWEs of each listed advisory that came without them, from
               the advisory read on its own (`get_one(ghsa)`). Seen with the App token: the list returned drafts without
-              them while the same token's other fields arrived. Every listed advisory is completed, not only the ones
-              picked, so its fingerprint is the same from run to run. Returns counts for the log: (with a range as
-              listed, with a range after completing, not readable on its own)."""
-              as_listed = sum(1 for a in advisories if a.get("vulnerabilities"))
-              unreadable = 0
+              them while the same token's other fields arrived. An entry without a range counts as missing, and the
+              single read's entries replace the listed ones only when more of them carry a range. Every listed advisory
+              is completed, not only the ones picked, so its fingerprint is the same from run to run. Returns
+              (with a range as listed, with a range after completing, the GHSAs that needed a read and got none)."""
+              as_listed = sum(1 for a in advisories if ranged(a))
+              unread = set()
               for adv in advisories:
-                  if adv.get("vulnerabilities") and cvss_vector(adv) and adv.get("cwe_ids") is not None:
+                  vulns = adv.get("vulnerabilities") or []
+                  if vulns and ranged(adv) == len(vulns) and cvss_vector(adv) and adv.get("cwe_ids") is not None:
                       continue
                   full = get_one(adv["ghsa_id"])
                   if not isinstance(full, dict) or full.get("ghsa_id") != adv["ghsa_id"]:
-                      unreadable += 1
+                      unread.add(adv["ghsa_id"])
                       continue
-                  for k in ("vulnerabilities", "cwe_ids", "cwes"):
+                  if ranged(full) > ranged(adv):
+                      adv["vulnerabilities"] = full["vulnerabilities"]
+                  for k in ("cwe_ids", "cwes"):
                       if full.get(k) and not adv.get(k):
                           adv[k] = full[k]
                   if cvss_vector(full) and not cvss_vector(adv):
                       adv["cvss"], adv["cvss_severities"] = full.get("cvss"), full.get("cvss_severities")
-              return as_listed, sum(1 for a in advisories if a.get("vulnerabilities")), unreadable
+              return as_listed, sum(1 for a in advisories if ranged(a)), unread
 
           def fingerprint(adv, reporter_comments):
               material = {k: adv.get(k) for k in ("summary", "description", "severity", "cwe_ids", "vulnerabilities")}
@@ -871,10 +880,13 @@ jobs:
                       return c, m.group(1), m.group(2)
               return None, None, None
 
-          def pick(advisories, comments_for, limit, only="", releases=(), package=""):
+          def pick(advisories, comments_for, limit, only="", releases=(), package="", unread=frozenset()):
               """Advisories to triage and the index for the posting job. `only` triages that one even if unchanged.
               New and changed reports go first, oldest first; an advisory left unfinished by an earlier run is retried
-              only when a slot is free, so one that keeps failing cannot hold the queue."""
+              only when a slot is free, so one that keeps failing cannot hold the queue. An advisory the bot already
+              commented on is skipped this run if it needed a single read and got none (`unread`): its fingerprint
+              would differ from the completed one only because the read failed, and it would be triaged again on a
+              guessed release. The next run reads it again."""
               candidates = []
               for adv in sorted(advisories, key=lambda a: a.get("created_at") or ""):
                   g = adv["ghsa_id"]
@@ -888,7 +900,7 @@ jobs:
                   fp = fingerprint(adv, reporter_comments)
                   release, source = first_release(adv, releases, package)
                   mine, old_fp, old_cls = bot_comment(comments)
-                  if old_fp == fp and not only:
+                  if not only and (old_fp == fp or (mine and g in unread)):
                       continue
                   humans = [c for c in comments if (c.get("user") or {}).get("type") != "Bot"][-MAX_COMMENTS:]
                   entry = {
@@ -919,18 +931,19 @@ jobs:
               advisories = []
               for state in json.loads(os.environ["STATES"]):
                   advisories += gh_list(f"repos/{target}/security-advisories?state={state}&per_page=100") or []
-              as_listed, with_range, unreadable = complete(
+              as_listed, with_range, unread = complete(
                   advisories, lambda g: gh_get(f"repos/{target}/security-advisories/{g}"))
               # Counts only: the log of a public repository must not carry report text or which reports exist.
               print(f"{as_listed} of {len(advisories)} unpublished advisories carry a version range as listed, "
-                    f"{with_range} after reading the others one by one ({unreadable} could not be read)")
+                    f"{with_range} after reading the others one by one ({len(unread)} could not be read; any of "
+                    "those already commented on wait for the next run)")
               cache = {}
               def comments_for(g):
                   if g not in cache:
                       cache[g] = gh_list(f"repos/{target}/security-advisories/{g}/comments?per_page=100")
                   return cache[g]
               repo = os.environ["CLI_REPO"]
-              todo, index = pick(advisories, comments_for, limit, only, releases_of(repo), f"github.com/{repo}")
+              todo, index = pick(advisories, comments_for, limit, only, releases_of(repo), f"github.com/{repo}", unread)
               write_manifests(todo, advisories, comments_for)
               # Counts only: the log of a public repository must not carry report text or which reports exist.
               print(f"{sum(len(t['manifests']) for t in todo)} manifest files from the reports to triage")

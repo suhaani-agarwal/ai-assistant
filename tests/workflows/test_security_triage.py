@@ -219,7 +219,7 @@ class Collect(unittest.TestCase):
             asked.append(g)
             return dict(advisory(g), **self.FULL)
         counts = self.s["complete"]([thin, whole], get_one)
-        self.assertEqual(counts, (1, 2, 0))
+        self.assertEqual(counts, (1, 2, set()))
         self.assertEqual(asked, [GHSA])  # a complete one is not read again
         self.assertEqual(thin["vulnerabilities"], self.FULL["vulnerabilities"])
         self.assertEqual(self.s["cvss_vector"](thin), self.FULL["cvss"]["vector_string"])
@@ -232,9 +232,9 @@ class Collect(unittest.TestCase):
 
     def test_an_advisory_that_cannot_be_read_alone_is_counted_and_never_named_in_the_log(self):
         thin = advisory(vulnerabilities=None)
-        self.assertEqual(self.s["complete"]([thin], lambda g: None), (0, 0, 1))
+        self.assertEqual(self.s["complete"]([thin], lambda g: None), (0, 0, {GHSA}))
         self.assertEqual(self.s["complete"]([advisory(vulnerabilities=None)], lambda g: advisory(OTHER, **self.FULL)),
-                         (0, 0, 1))  # someone else's advisory is not used
+                         (0, 0, {GHSA}))  # someone else's advisory is not used
         self.assertIsNone(thin["vulnerabilities"])
         failed = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "report text", "")
         with mock.patch.object(self.s["subprocess"], "run", failed), mock.patch("sys.stdout") as stdout:
@@ -244,6 +244,40 @@ class Collect(unittest.TestCase):
         self.assertNotIn(GHSA, printed)
         self.assertNotIn("report text", printed)
         self.assertIn("security-advisories/<GHSA>/comments failed", printed)
+
+    def test_entries_without_a_range_are_read_again_and_a_listed_range_is_kept(self):
+        rangeless = [{"package": {"name": "github.com/kyverno/kyverno"}, "vulnerable_version_range": None}]
+        thin = advisory(vulnerabilities=rangeless, cvss=self.FULL["cvss"], cwe_ids=["CWE-269"])
+        asked = []
+        def get_one(g):
+            asked.append(g)
+            return dict(advisory(g), **self.FULL)
+        self.assertEqual(self.s["complete"]([thin], get_one), (0, 1, set()))
+        self.assertEqual(asked, [GHSA])
+        self.assertEqual(thin["vulnerabilities"], self.FULL["vulnerabilities"])
+        todo, _ = self.s["pick"]([thin], self.comments({}), 1, "", self.DATED, "github.com/kyverno/kyverno")
+        self.assertEqual(todo[0]["reported_release_source"], "range")
+        # A listed range is never swapped for a read that carries fewer.
+        listed = [{"package": {"name": "github.com/kyverno/kyverno"}, "vulnerable_version_range": "<= 1.16.2"},
+                  {"package": {"name": "github.com/kyverno/other"}, "vulnerable_version_range": ""}]
+        partial = advisory(vulnerabilities=listed)
+        self.s["complete"]([partial], lambda g: dict(advisory(g), vulnerabilities=rangeless))
+        self.assertEqual(partial["vulnerabilities"], listed)
+
+    def test_a_failed_read_never_retriages_a_report_the_bot_already_commented_on(self):
+        # Fingerprinted when the read worked; this run the read failed, so the fingerprint differs.
+        whole = advisory(**self.FULL)
+        mine = comment("triage[bot]", f"<!-- security-triage:v1 fingerprint={self.s['fingerprint'](whole, [])} "
+                       "classification=reproduced -->", bot=True, id=9)
+        thin = advisory(vulnerabilities=None, cwe_ids=None)
+        _, _, unread = self.s["complete"]([thin], lambda g: None)
+        todo, _ = self.s["pick"]([thin], self.comments({GHSA: [mine]}), 1, "", self.DATED, "", unread)
+        self.assertEqual(todo, [])
+        # A manual run still triages it, and a report never commented on is still picked.
+        todo, _ = self.s["pick"]([thin], self.comments({GHSA: [mine]}), 1, GHSA, self.DATED, "", unread)
+        self.assertEqual([t["ghsa_id"] for t in todo], [GHSA])
+        todo, _ = self.s["pick"]([thin], self.comments({}), 1, "", self.DATED, "", unread)
+        self.assertEqual([t["ghsa_id"] for t in todo], [GHSA])
 
     def test_collect_reads_with_a_write_token_and_writes_the_agents_input_indented(self):
         front, _ = split_component(SHARED)
@@ -255,6 +289,7 @@ class Collect(unittest.TestCase):
         wired = 'complete(\n                  advisories, lambda g: gh_get(f"repos/{target}/security-advisories/{g}"))'
         self.assertIn(wired, text)
         self.assertLess(text.index(wired), text.index("todo, index = pick("))
+        self.assertIn('f"github.com/{repo}", unread)', text)
 
     def test_every_published_advisory_is_kept_for_duplicate_checks(self):
         self.assertIn('state=published&per_page=100") or [])]\n', SHARED.read_text())

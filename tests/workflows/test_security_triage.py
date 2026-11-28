@@ -264,19 +264,36 @@ class Collect(unittest.TestCase):
         self.s["complete"]([partial], lambda g: dict(advisory(g), vulnerabilities=rangeless))
         self.assertEqual(partial["vulnerabilities"], listed)
 
-    def test_a_failed_read_never_retriages_a_report_the_bot_already_commented_on(self):
-        # Fingerprinted when the read worked; this run the read failed, so the fingerprint differs.
-        whole = advisory(**self.FULL)
-        mine = comment("triage[bot]", f"<!-- security-triage:v1 fingerprint={self.s['fingerprint'](whole, [])} "
-                       "classification=reproduced -->", bot=True, id=9)
-        thin = advisory(vulnerabilities=None, cwe_ids=None)
-        _, _, unread = self.s["complete"]([thin], lambda g: None)
-        todo, _ = self.s["pick"]([thin], self.comments({GHSA: [mine]}), 1, "", self.DATED, "", unread)
-        self.assertEqual(todo, [])
-        # A manual run still triages it, and a report never commented on is still picked.
-        todo, _ = self.s["pick"]([thin], self.comments({GHSA: [mine]}), 1, GHSA, self.DATED, "", unread)
-        self.assertEqual([t["ghsa_id"] for t in todo], [GHSA])
-        todo, _ = self.s["pick"]([thin], self.comments({}), 1, "", self.DATED, "", unread)
+    def test_a_range_listed_for_one_package_survives_a_single_read_that_ranges_others(self):
+        pkg = lambda name, r: {"package": {"name": name}, "vulnerable_version_range": r}
+        listed = [pkg("github.com/kyverno/kyverno", "<= 1.16.2"), pkg("github.com/kyverno/a", None)]
+        # The single read disagrees on kyverno's range; the listed one is kept.
+        single = [pkg("github.com/kyverno/kyverno", "< 1.20.0"), pkg("github.com/kyverno/a", "< 2.0.0"),
+                  pkg("github.com/kyverno/b", "< 3.0.0"), pkg("github.com/kyverno/c", "")]
+        adv = advisory(vulnerabilities=listed)
+        self.s["complete"]([adv], lambda g: dict(advisory(g), vulnerabilities=single))
+        self.assertEqual(adv["vulnerabilities"], [pkg("github.com/kyverno/kyverno", "<= 1.16.2"),
+                                                  pkg("github.com/kyverno/a", "< 2.0.0"),
+                                                  pkg("github.com/kyverno/b", "< 3.0.0")])
+        todo, _ = self.s["pick"]([adv], self.comments({}), 1, "", self.DATED, "github.com/kyverno/kyverno")
+        self.assertEqual((todo[0]["reported_release"], todo[0]["reported_release_source"]), ("v1.16.2", "range"))
+
+    def test_the_fingerprint_is_the_listed_advisorys_so_a_single_read_cannot_change_it(self):
+        listed = advisory(vulnerabilities=None, cwe_ids=None)
+        fp = self.s["fingerprint"](listed, [])
+        mine = comment("triage[bot]", f"<!-- security-triage:v1 fingerprint={fp} classification=reproduced -->",
+                       bot=True, id=9)
+        for read in (lambda g: dict(advisory(g), **self.FULL), lambda g: None):  # the read works, then fails
+            adv = advisory(vulnerabilities=None, cwe_ids=None)
+            snapshot = {GHSA: json.loads(json.dumps(adv))}
+            self.s["complete"]([adv], read)
+            todo, _ = self.s["pick"]([adv], self.comments({GHSA: [mine]}), 1, "", self.DATED, "", snapshot)
+            self.assertEqual(todo, [])
+        # A real change to the report is still seen, read or no read.
+        changed = advisory(vulnerabilities=None, cwe_ids=None, description="Steps, with a new policy.")
+        snapshot = {GHSA: json.loads(json.dumps(changed))}
+        self.s["complete"]([changed], lambda g: None)
+        todo, _ = self.s["pick"]([changed], self.comments({GHSA: [mine]}), 1, "", self.DATED, "", snapshot)
         self.assertEqual([t["ghsa_id"] for t in todo], [GHSA])
 
     def test_collect_reads_with_a_write_token_and_writes_the_agents_input_indented(self):
@@ -289,7 +306,9 @@ class Collect(unittest.TestCase):
         wired = 'complete(\n                  advisories, lambda g: gh_get(f"repos/{target}/security-advisories/{g}"))'
         self.assertIn(wired, text)
         self.assertLess(text.index(wired), text.index("todo, index = pick("))
-        self.assertIn('f"github.com/{repo}", unread)', text)
+        self.assertIn('listed = {a["ghsa_id"]: copy.deepcopy(a) for a in advisories}', text)
+        self.assertLess(text.index("copy.deepcopy(a) for a in advisories"), text.index(wired))
+        self.assertIn('f"github.com/{repo}", listed)', text)
 
     def test_every_published_advisory_is_kept_for_duplicate_checks(self):
         self.assertIn('state=published&per_page=100") or [])]\n', SHARED.read_text())

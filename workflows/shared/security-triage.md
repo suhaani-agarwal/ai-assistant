@@ -573,7 +573,7 @@ jobs:
           RELEASES_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY'
-          import hashlib, json, os, re, subprocess, urllib.request
+          import copy, hashlib, json, os, re, subprocess, urllib.request
           from datetime import datetime
           import yaml
 
@@ -840,13 +840,30 @@ jobs:
               return sum(1 for v in adv.get("vulnerabilities") or []
                          if str((v or {}).get("vulnerable_version_range") or "").strip())
 
+          def merge_ranges(listed, single):
+              """The listed affected-product entries, each keeping its own range. An entry without one takes the range
+              of the single read's entry for the same package, and the single read's other packages with a range are
+              added. Nothing listed is dropped."""
+              package = lambda v: str(((v or {}).get("package") or {}).get("name") or "").lower()
+              has = lambda v: bool(str((v or {}).get("vulnerable_version_range") or "").strip())
+              found = {}
+              for v in single or []:
+                  if has(v):
+                      found.setdefault(package(v), v)
+              merged, seen = [], set()
+              for v in listed or []:
+                  seen.add(package(v))
+                  if not has(v) and package(v) in found:
+                      v = dict(v, vulnerable_version_range=found[package(v)]["vulnerable_version_range"])
+                  merged.append(v)
+              return merged + [v for k, v in found.items() if k not in seen]
+
           def complete(advisories, get_one):
               """Fill in the version ranges, CVSS vector and CWEs of each listed advisory that came without them, from
               the advisory read on its own (`get_one(ghsa)`). Seen with the App token: the list returned drafts without
-              them while the same token's other fields arrived. An entry without a range counts as missing, and the
-              single read's entries replace the listed ones only when more of them carry a range. Every listed advisory
-              is completed, not only the ones picked, so its fingerprint is the same from run to run. Returns
-              (with a range as listed, with a range after completing, the GHSAs that needed a read and got none)."""
+              them while the same token's other fields arrived. An entry without a range counts as missing. Every
+              listed advisory is completed, so the log's counts describe the whole list. Returns (with a range as
+              listed, with a range after completing, the GHSAs that needed a read and got none)."""
               as_listed = sum(1 for a in advisories if ranged(a))
               unread = set()
               for adv in advisories:
@@ -857,8 +874,7 @@ jobs:
                   if not isinstance(full, dict) or full.get("ghsa_id") != adv["ghsa_id"]:
                       unread.add(adv["ghsa_id"])
                       continue
-                  if ranged(full) > ranged(adv):
-                      adv["vulnerabilities"] = full["vulnerabilities"]
+                  adv["vulnerabilities"] = merge_ranges(adv.get("vulnerabilities"), full.get("vulnerabilities"))
                   for k in ("cwe_ids", "cwes"):
                       if full.get(k) and not adv.get(k):
                           adv[k] = full[k]
@@ -880,13 +896,12 @@ jobs:
                       return c, m.group(1), m.group(2)
               return None, None, None
 
-          def pick(advisories, comments_for, limit, only="", releases=(), package="", unread=frozenset()):
+          def pick(advisories, comments_for, limit, only="", releases=(), package="", as_listed=None):
               """Advisories to triage and the index for the posting job. `only` triages that one even if unchanged.
               New and changed reports go first, oldest first; an advisory left unfinished by an earlier run is retried
-              only when a slot is free, so one that keeps failing cannot hold the queue. An advisory the bot already
-              commented on is skipped this run if it needed a single read and got none (`unread`): its fingerprint
-              would differ from the completed one only because the read failed, and it would be triaged again on a
-              guessed release. The next run reads it again."""
+              only when a slot is free, so one that keeps failing cannot hold the queue. The fingerprint is taken from
+              the advisory as the list returned it (`as_listed`, by GHSA), before `complete` filled anything in, so a
+              single read that works one run and fails the next cannot make an unchanged report look changed."""
               candidates = []
               for adv in sorted(advisories, key=lambda a: a.get("created_at") or ""):
                   g = adv["ghsa_id"]
@@ -897,10 +912,10 @@ jobs:
                       continue
                   reporter = (adv.get("author") or {}).get("login")
                   reporter_comments = [c for c in comments if (c.get("user") or {}).get("login") == reporter]
-                  fp = fingerprint(adv, reporter_comments)
+                  fp = fingerprint((as_listed or {}).get(g, adv), reporter_comments)
                   release, source = first_release(adv, releases, package)
                   mine, old_fp, old_cls = bot_comment(comments)
-                  if not only and (old_fp == fp or (mine and g in unread)):
+                  if old_fp == fp and not only:
                       continue
                   humans = [c for c in comments if (c.get("user") or {}).get("type") != "Bot"][-MAX_COMMENTS:]
                   entry = {
@@ -931,19 +946,19 @@ jobs:
               advisories = []
               for state in json.loads(os.environ["STATES"]):
                   advisories += gh_list(f"repos/{target}/security-advisories?state={state}&per_page=100") or []
-              as_listed, with_range, unread = complete(
+              listed = {a["ghsa_id"]: copy.deepcopy(a) for a in advisories}
+              ranged_listed, ranged_after, unread = complete(
                   advisories, lambda g: gh_get(f"repos/{target}/security-advisories/{g}"))
               # Counts only: the log of a public repository must not carry report text or which reports exist.
-              print(f"{as_listed} of {len(advisories)} unpublished advisories carry a version range as listed, "
-                    f"{with_range} after reading the others one by one ({len(unread)} could not be read; any of "
-                    "those already commented on wait for the next run)")
+              print(f"{ranged_listed} of {len(advisories)} unpublished advisories carry a version range as listed, "
+                    f"{ranged_after} after reading the others one by one ({len(unread)} could not be read)")
               cache = {}
               def comments_for(g):
                   if g not in cache:
                       cache[g] = gh_list(f"repos/{target}/security-advisories/{g}/comments?per_page=100")
                   return cache[g]
               repo = os.environ["CLI_REPO"]
-              todo, index = pick(advisories, comments_for, limit, only, releases_of(repo), f"github.com/{repo}", unread)
+              todo, index = pick(advisories, comments_for, limit, only, releases_of(repo), f"github.com/{repo}", listed)
               write_manifests(todo, advisories, comments_for)
               # Counts only: the log of a public repository must not carry report text or which reports exist.
               print(f"{sum(len(t['manifests']) for t in todo)} manifest files from the reports to triage")
